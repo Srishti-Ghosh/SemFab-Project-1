@@ -317,8 +317,8 @@ class ThreeDViewDialog(QDialog):
 
     def set_view_angles(self, x, y): self.angle_x, self.angle_y = x, y; self.draw_3d_view()
     def set_iso_view(self): self.set_view_angles(35.0, -45.0)
-    def set_top_view(self): self.set_view_angles(90, 0)
-    def set_front_view(self): self.set_view_angles(0, 0)
+    def set_top_view(self): self.set_view_angles(0, 0)
+    def set_front_view(self): self.set_view_angles(-90, 0)
     def set_side_view(self): self.set_view_angles(0, -90)
 
     def save_image(self):
@@ -328,8 +328,8 @@ class ThreeDViewDialog(QDialog):
 
     def on_slider_change(self):
         for name, slider in self.sliders.items():
-             self.layer_thicknesses[name] = slider.value()
-             slider.value_label.setText(f"{slider.value()}")
+            self.layer_thicknesses[name] = slider.value()
+            slider.value_label.setText(f"{slider.value()}")
         self.draw_3d_view()
 
     def project_point(self, x, y, z):
@@ -342,8 +342,9 @@ class ThreeDViewDialog(QDialog):
     def draw_3d_view(self):
         self.scene.clear()
 
-        def get_all_shapes_as_polygons(cell, t=QTransform()):
+        def get_all_shapes_as_polygons(cell, origin=(0, 0), rotation=0, mag=1.0):
             shapes = []
+            t = QTransform().translate(origin[0], origin[1]).rotate(rotation).scale(mag, mag)
             for p_data in cell.polygons:
                 if (layer := self.project.layer_by_name.get(p_data.layer)) and layer.visible:
                     poly = t.map(QPolygonF([QPointF(*p) for p in p_data.points]))
@@ -351,17 +352,16 @@ class ThreeDViewDialog(QDialog):
             for e_data in cell.ellipses:
                 if (layer := self.project.layer_by_name.get(e_data.layer)) and layer.visible:
                     rect = QRectF(*e_data.rect)
-                    poly = QPolygonF([QPointF(rect.center().x() + rect.width()/2 * math.cos(a),
-                                              rect.center().y() + rect.height()/2 * math.sin(a))
-                                      for a in [i/16*math.pi for i in range(32)]])
+                    poly = QPolygonF([QPointF(rect.center().x() + rect.width()/2 * math.cos(i/16*math.pi),
+                                              rect.center().y() + rect.height()/2 * math.sin(i/16*math.pi)) for i in range(32)])
                     shapes.append((e_data.layer, [(p.x(), p.y()) for p in t.map(poly)]))
             for ref in cell.references:
                 if ref.cell in self.project.cells:
-                    child_t = QTransform(t)
-                    child_t.translate(ref.origin[0], ref.origin[1])
-                    child_t.rotate(ref.rotation)
-                    child_t.scale(ref.magnification, ref.magnification)
-                    shapes.extend(get_all_shapes_as_polygons(self.project.cells[ref.cell], child_t))
+                    ref_origin_transformed = t.map(QPointF(*ref.origin))
+                    shapes.extend(get_all_shapes_as_polygons(self.project.cells[ref.cell],
+                                                             (ref_origin_transformed.x(), ref_origin_transformed.y()),
+                                                             ref.rotation + rotation,
+                                                             ref.magnification * mag))
             return shapes
 
         all_shapes_by_layer = {layer.name: [] for layer in self.project.layers}
@@ -379,26 +379,54 @@ class ThreeDViewDialog(QDialog):
         min_y, max_y = min(p[1] for p in all_points_flat), max(p[1] for p in all_points_flat)
         center_x, center_y = (min_x + max_x) / 2, (min_y + max_y) / 2
 
-        all_faces = []
-        z_offset = 0
+        # --- THIS IS THE FIX ---
+        # Instead of simple layer stacking, we use a height map to build structures from the ground up.
+        grid_step = 25.0
+        height_map, all_faces = {}, []
 
         for layer in self.project.layers:
-            if not layer.visible: continue
+            if not layer.visible or not Path: continue
+
             thickness = self.layer_thicknesses.get(layer.name, 10)
             color = QColor(*layer.color)
 
             for points_2d in all_shapes_by_layer.get(layer.name, []):
-                centered_pts = [(p[0] - center_x, p[1] - center_y) for p in points_2d]
-                floor_pts = [(*p, z_offset) for p in centered_pts]
-                ceiling_pts = [(*p, z_offset + thickness) for p in centered_pts]
+                # Use matplotlib.path to check which grid points are inside the polygon
+                path = Path(points_2d)
+                
+                # Find the bounding box of the polygon in grid coordinates
+                p_min_x_g = int(min(p[0] for p in points_2d) // grid_step)
+                p_max_x_g = int(max(p[0] for p in points_2d) // grid_step)
+                p_min_y_g = int(min(p[1] for p in points_2d) // grid_step)
+                p_max_y_g = int(max(p[1] for p in points_2d) // grid_step)
 
-                all_faces.append((ceiling_pts, color.lighter(110))) # Top face
-                for i in range(len(floor_pts)): # Side walls
+                # Find the highest point on the surface underneath the new shape
+                footprint_z_values = [0]
+                for gx in range(p_min_x_g, p_max_x_g + 1):
+                    for gy in range(p_min_y_g, p_max_y_g + 1):
+                        if path.contains_point(((gx + 0.5) * grid_step, (gy + 0.5) * grid_step)):
+                            footprint_z_values.append(height_map.get((gx, gy), 0))
+                
+                base_z = max(footprint_z_values)
+
+                # Create the 3D faces for this shape starting from base_z
+                centered_pts = [(p[0] - center_x, p[1] - center_y) for p in points_2d]
+                floor_pts = [(*p, base_z) for p in centered_pts]
+                ceiling_pts = [(*p, base_z + thickness) for p in centered_pts]
+                all_faces.append((ceiling_pts, color.lighter(110)))
+                all_faces.append((floor_pts, color.darker(120)))
+
+                for i in range(len(floor_pts)):
                     p1, p2 = floor_pts[i], floor_pts[(i + 1) % len(floor_pts)]
                     p3, p4 = ceiling_pts[(i + 1) % len(floor_pts)], ceiling_pts[i]
                     all_faces.append(([p1, p2, p3, p4], color))
 
-            z_offset += thickness
+                # Update the height map with the new top surface
+                new_top_z = base_z + thickness
+                for gx in range(p_min_x_g, p_max_x_g + 1):
+                    for gy in range(p_min_y_g, p_max_y_g + 1):
+                        if path.contains_point(((gx + 0.5) * grid_step, (gy + 0.5) * grid_step)):
+                            height_map[(gx, gy)] = new_top_z
 
         all_faces.sort(key=lambda face: sum(self.project_point(*p).y() for p in face[0])/len(face[0]))
 
@@ -407,11 +435,13 @@ class ThreeDViewDialog(QDialog):
             pen = QPen(col.darker(110), 0)
             self.scene.addPolygon(QPolygonF(points_2d), pen, QBrush(col))
 
-        axis_length = max(max_x - min_x, max_y - min_y, z_offset) * 0.75
-        origin_proj = self.project_point(0, 0, -z_offset / 2) # Center origin visually
+        # Update axes to reflect the calculated total height
+        total_height = max(height_map.values()) if height_map else sum(t for n, t in self.layer_thicknesses.items() if self.project.layer_by_name[n].visible)
+        axis_length = max(max_x - min_x, max_y - min_y, total_height) * 0.75
+        origin_proj = self.project_point(0, 0, 0)
         axes = [((axis_length,0,0),"red","X"), ((0,axis_length,0),"green","Y"), ((0,0,axis_length),"blue","Z")]
         for axis, color_str, name in axes:
-            end = self.project_point(axis[0], axis[1], axis[2] - z_offset/2)
+            end = self.project_point(*axis)
             self.scene.addLine(QLineF(origin_proj, end), QPen(QColor(color_str), 2))
             label = self.scene.addText(name); label.setDefaultTextColor(QColor(color_str)); label.setPos(end)
             label.setFlag(QGraphicsItem.ItemIgnoresTransformations)
