@@ -379,8 +379,6 @@ class ThreeDViewDialog(QDialog):
         min_y, max_y = min(p[1] for p in all_points_flat), max(p[1] for p in all_points_flat)
         center_x, center_y = (min_x + max_x) / 2, (min_y + max_y) / 2
 
-        # --- THIS IS THE FIX ---
-        # Instead of simple layer stacking, we use a height map to build structures from the ground up.
         grid_step = 25.0
         height_map, all_faces = {}, []
 
@@ -391,16 +389,13 @@ class ThreeDViewDialog(QDialog):
             color = QColor(*layer.color)
 
             for points_2d in all_shapes_by_layer.get(layer.name, []):
-                # Use matplotlib.path to check which grid points are inside the polygon
                 path = Path(points_2d)
                 
-                # Find the bounding box of the polygon in grid coordinates
                 p_min_x_g = int(min(p[0] for p in points_2d) // grid_step)
                 p_max_x_g = int(max(p[0] for p in points_2d) // grid_step)
                 p_min_y_g = int(min(p[1] for p in points_2d) // grid_step)
                 p_max_y_g = int(max(p[1] for p in points_2d) // grid_step)
 
-                # Find the highest point on the surface underneath the new shape
                 footprint_z_values = [0]
                 for gx in range(p_min_x_g, p_max_x_g + 1):
                     for gy in range(p_min_y_g, p_max_y_g + 1):
@@ -409,7 +404,6 @@ class ThreeDViewDialog(QDialog):
                 
                 base_z = max(footprint_z_values)
 
-                # Create the 3D faces for this shape starting from base_z
                 centered_pts = [(p[0] - center_x, p[1] - center_y) for p in points_2d]
                 floor_pts = [(*p, base_z) for p in centered_pts]
                 ceiling_pts = [(*p, base_z + thickness) for p in centered_pts]
@@ -421,12 +415,41 @@ class ThreeDViewDialog(QDialog):
                     p3, p4 = ceiling_pts[(i + 1) % len(floor_pts)], ceiling_pts[i]
                     all_faces.append(([p1, p2, p3, p4], color))
 
-                # Update the height map with the new top surface
                 new_top_z = base_z + thickness
                 for gx in range(p_min_x_g, p_max_x_g + 1):
                     for gy in range(p_min_y_g, p_max_y_g + 1):
                         if path.contains_point(((gx + 0.5) * grid_step, (gy + 0.5) * grid_step)):
                             height_map[(gx, gy)] = new_top_z
+
+        total_height = max(height_map.values()) if height_map else 0
+
+        # --- NEW CODE START: Add a translucent bounding box ---
+        if total_height > 0:
+            w = max_x - min_x
+            h = max_y - min_y
+            d = total_height
+
+            # Define the 8 vertices of the box, centered like the model
+            v = [
+                (-w/2, -h/2, 0), (w/2, -h/2, 0), (w/2, h/2, 0), (-w/2, h/2, 0), # Bottom
+                (-w/2, -h/2, d), (w/2, -h/2, d), (w/2, h/2, d), (-w/2, h/2, d)  # Top
+            ]
+
+            # Define the 6 faces using vertex indices
+            box_faces_indices = [
+                (0, 1, 2, 3),  # Bottom
+                (4, 5, 6, 7),  # Top
+                (0, 3, 7, 4),  # Left
+                (1, 2, 6, 5),  # Right
+                (0, 1, 5, 4),  # Back
+                (2, 3, 7, 6)   # Front
+            ]
+            
+            box_color = QColor(150, 150, 150, 40) # A light, translucent gray
+            for face_indices in box_faces_indices:
+                face_points = [v[i] for i in face_indices]
+                all_faces.append((face_points, box_color))
+        # --- NEW CODE END ---
 
         all_faces.sort(key=lambda face: sum(self.project_point(*p).y() for p in face[0])/len(face[0]))
 
@@ -434,9 +457,7 @@ class ThreeDViewDialog(QDialog):
             points_2d = [self.project_point(*p) for p in points_3d]
             pen = QPen(col.darker(110), 0)
             self.scene.addPolygon(QPolygonF(points_2d), pen, QBrush(col))
-
-        # Update axes to reflect the calculated total height
-        total_height = max(height_map.values()) if height_map else sum(t for n, t in self.layer_thicknesses.items() if self.project.layer_by_name[n].visible)
+            
         axis_length = max(max_x - min_x, max_y - min_y, total_height) * 0.75
         origin_proj = self.project_point(0, 0, 0)
         axes = [((axis_length,0,0),"red","X"), ((0,axis_length,0),"green","Y"), ((0,0,axis_length),"blue","Z")]
