@@ -129,8 +129,8 @@ class WelcomeDialog(QDialog):
         icon_path = os.path.join(script_dir, 'icons', f'{icon_name}.svg')
         pixmap = QPixmap(icon_path)
         if pixmap.isNull():
-                 pixmap = QPixmap(size, size)
-                 pixmap.fill(Qt.transparent)
+                    pixmap = QPixmap(size, size)
+                    pixmap.fill(Qt.transparent)
         is_dark = self.palette().color(QPalette.Window).value() < 128
         if is_dark:
             painter = QPainter(pixmap)
@@ -390,7 +390,7 @@ class ThreeDViewDialog(QDialog):
 
             for points_2d in all_shapes_by_layer.get(layer.name, []):
                 path = Path(points_2d)
-                
+
                 p_min_x_g = int(min(p[0] for p in points_2d) // grid_step)
                 p_max_x_g = int(max(p[0] for p in points_2d) // grid_step)
                 p_min_y_g = int(min(p[1] for p in points_2d) // grid_step)
@@ -401,7 +401,7 @@ class ThreeDViewDialog(QDialog):
                     for gy in range(p_min_y_g, p_max_y_g + 1):
                         if path.contains_point(((gx + 0.5) * grid_step, (gy + 0.5) * grid_step)):
                             footprint_z_values.append(height_map.get((gx, gy), 0))
-                
+
                 base_z = max(footprint_z_values)
 
                 centered_pts = [(p[0] - center_x, p[1] - center_y) for p in points_2d]
@@ -444,7 +444,7 @@ class ThreeDViewDialog(QDialog):
                 (0, 1, 5, 4),  # Back
                 (2, 3, 7, 6)   # Front
             ]
-            
+
             box_color = QColor(150, 150, 150, 40) # A light, translucent gray
             for face_indices in box_faces_indices:
                 face_points = [v[i] for i in face_indices]
@@ -457,7 +457,7 @@ class ThreeDViewDialog(QDialog):
             points_2d = [self.project_point(*p) for p in points_3d]
             pen = QPen(col.darker(110), 0)
             self.scene.addPolygon(QPolygonF(points_2d), pen, QBrush(col))
-            
+
         axis_length = max(max_x - min_x, max_y - min_y, total_height) * 0.75
         origin_proj = self.project_point(0, 0, 0)
         axes = [((axis_length,0,0),"red","X"), ((0,axis_length,0),"green","Y"), ((0,0,axis_length),"blue","Z")]
@@ -470,22 +470,6 @@ class ThreeDViewDialog(QDialog):
 
 
 # -------------------------- Graphics items --------------------------
-
-class VertexHandle(QGraphicsEllipseItem):
-    def __init__(self, parent_poly, index):
-        self.poly_item = parent_poly
-        self.index = index
-        point = self.poly_item.polygon()[self.index]
-        super().__init__(point.x() - 4, point.y() - 4, 8, 8, parent=parent_poly)
-        self.setBrush(QBrush(QColor("cyan")))
-        self.setPen(QPen(QColor("blue"), 0.5))
-        self.setFlags(QGraphicsItem.ItemIsMovable | QGraphicsItem.ItemSendsGeometryChanges)
-
-    def itemChange(self, change, value):
-        if change == QGraphicsItem.ItemPositionChange:
-            new_pos = self.poly_item.mapToParent(value)
-            self.poly_item.update_vertex(self.index, new_pos)
-        return super().itemChange(change, value)
 
 class SceneItemMixin:
     def __init__(self, *args, **kwargs):
@@ -540,17 +524,11 @@ class PolyItem(QGraphicsPolygonItem, SceneItemMixin):
         self.layer = layer; self.base_color = QColor(*self.layer.color); self.data_obj = data_obj
         self.setFlags(QGraphicsItem.ItemIsSelectable | QGraphicsItem.ItemIsMovable if selectable else 0)
         self.refresh_appearance(selected=False)
-        self.handles = []
         if self.data_obj.name: self.setToolTip(self.data_obj.name)
 
     def mousePressEvent(self, event):
-        win = self.scene().views()[0].parent_win
-        if win.view.mode == win.view.MODES["vertex_edit"]:
-            win.start_vertex_edit(self)
-            event.accept()
-        else:
-            super().mousePressEvent(event)
-            self.customMousePressEvent(event)
+        super().mousePressEvent(event)
+        self.customMousePressEvent(event)
 
     def mouseReleaseEvent(self, event):
         super().mouseReleaseEvent(event)
@@ -572,12 +550,6 @@ class PolyItem(QGraphicsPolygonItem, SceneItemMixin):
         if dlg.exec_() == QDialog.Accepted and (vals := dlg.get_values()):
             self.setPolygon(QPolygonF([QPointF(x, y) for x, y in vals["points"]]))
             self.scene().views()[0].parent_win.update_data_from_item_edit(self)
-
-    def update_vertex(self, index, pos):
-        poly = self.polygon()
-        poly[index] = self.mapFromScene(pos) if self.scene() else pos
-        self.setPolygon(poly)
-        self.scene().views()[0].parent_win.update_data_from_item_edit(self)
 
 class CircleItem(QGraphicsEllipseItem, SceneItemMixin):
     def __init__(self, rect, layer, data_obj, selectable=True):
@@ -725,7 +697,7 @@ class CanvasContainer(QWidget):
         self.canvas.zoomChanged.connect(self.v_ruler.update)
 
 class Canvas(QGraphicsView):
-    MODES = {"select": 1, "rect": 2, "poly": 3, "circle": 4, "move": 5, "measure": 6, "vertex_edit": 7}
+    MODES = {"select": 1, "rect": 2, "poly": 3, "circle": 4, "move": 5, "measure": 6}
     zoomChanged = pyqtSignal()
 
     def __init__(self, scene, get_active_layer, parent=None):
@@ -776,7 +748,6 @@ class Canvas(QGraphicsView):
         self.translate(delta.x(), delta.y()); self.zoomChanged.emit()
 
     def set_mode(self, mode_name: str):
-        self.parent_win.stop_vertex_edit()
         self.mode = self.MODES.get(mode_name, self.MODES["select"])
 
         is_move_mode = (self.mode == self.MODES["move"])
@@ -871,7 +842,6 @@ class Canvas(QGraphicsView):
 
     def keyPressEvent(self, event):
         if event.key() == Qt.Key_Escape:
-            self.parent_win.stop_vertex_edit()
             self.parent_win.set_active_tool("select")
             self.temp_cancel()
         elif event.key() == Qt.Key_Delete: self.parent_win.delete_selected_items()
@@ -913,7 +883,6 @@ class MainWindow(QMainWindow):
         self.project = None
         self.current_file_path = None
         self._is_dirty = False
-        self._vertex_edit_item = None
         self._undo_stack, self._redo_stack = [], []
 
         self._build_ui()
@@ -961,9 +930,9 @@ class MainWindow(QMainWindow):
     def closeEvent(self, event):
         if self._is_dirty:
             reply = QMessageBox.question(self, 'Unsaved Changes',
-                                       "You have unsaved changes. Do you want to save them before closing?",
-                                       QMessageBox.Save | QMessageBox.Discard | QMessageBox.Cancel,
-                                       QMessageBox.Save)
+                                         "You have unsaved changes. Do you want to save them before closing?",
+                                         QMessageBox.Save | QMessageBox.Discard | QMessageBox.Cancel,
+                                         QMessageBox.Save)
             if reply == QMessageBox.Save:
                 if self.save_json():
                     event.accept()
@@ -980,9 +949,9 @@ class MainWindow(QMainWindow):
         if not self._is_dirty:
             return True
         reply = QMessageBox.question(self, 'Unsaved Changes',
-                                   "You have unsaved changes. Do you want to save them first?",
-                                   QMessageBox.Save | QMessageBox.Discard | QMessageBox.Cancel,
-                                   QMessageBox.Save)
+                                     "You have unsaved changes. Do you want to save them first?",
+                                     QMessageBox.Save | QMessageBox.Discard | QMessageBox.Cancel,
+                                     QMessageBox.Save)
         if reply == QMessageBox.Save:
             return self.save_json()
         elif reply == QMessageBox.Discard:
@@ -1073,7 +1042,7 @@ class MainWindow(QMainWindow):
         project.refresh_layer_map()
         layer_num_to_name = {l_num: f"Layer_{l_num}" for l_num in gds_layers}
         for l_num, meta in layer_meta.items():
-                 if 'name' in meta: layer_num_to_name[l_num] = meta['name']
+                    if 'name' in meta: layer_num_to_name[l_num] = meta['name']
 
         for cell in lib.cells:
             new_cell = Cell()
@@ -1247,7 +1216,6 @@ class MainWindow(QMainWindow):
         ]))
         draw_layout.addWidget(self._create_ribbon_group("Modify", [
             self._create_action_button("Rename", "tag", self.rename_selected_shape),
-            self._create_tool_button("vertex_edit", "Vertex Edit", "git-pull-request"),
             self._create_action_button("Re-snap", "grid", self.resnap_all_items_to_grid),
             self._create_action_button("Finish Poly", "check-square", lambda: self.view.finish_polygon()),
             self._create_action_button("Fillet", "git-commit", self.fillet_selected_poly)
@@ -1377,7 +1345,7 @@ class MainWindow(QMainWindow):
         self._undo_stack.append(copy.deepcopy(self.project))
         if len(self._undo_stack) > 50: self._undo_stack.pop(0)
         if len(self._undo_stack) > 1:
-                 self._mark_dirty()
+                    self._mark_dirty()
 
     def undo(self):
         if len(self._undo_stack) > 1:
@@ -1635,7 +1603,7 @@ class MainWindow(QMainWindow):
 
     def _redraw_scene(self):
         if not self.project: return
-        self.stop_vertex_edit(); self.scene.clear()
+        self.scene.clear()
         if self.active_cell_name: self._draw_active_cell()
         if hasattr(self, 'view') and self.view:
             current_mode_name = next((name for name, val in self.view.MODES.items() if val == self.view.mode), "select")
@@ -1704,30 +1672,13 @@ class MainWindow(QMainWindow):
                 total_rect = total_rect.united(transform.mapRect(child_bounds))
         return total_rect
 
-    def start_vertex_edit(self, poly_item):
-        self.stop_vertex_edit()
-        self._vertex_edit_item = poly_item
-        poly_item.setFlag(QGraphicsItem.ItemIsMovable, False)
-        for i in range(len(poly_item.polygon())):
-            handle = VertexHandle(poly_item, i)
-            self.scene.addItem(handle)
-            poly_item.handles.append(handle)
-
-    def stop_vertex_edit(self):
-        if self._vertex_edit_item:
-            self._vertex_edit_item.setFlag(QGraphicsItem.ItemIsMovable, True)
-            for handle in self._vertex_edit_item.handles:
-                self.scene.removeItem(handle)
-            self._vertex_edit_item.handles.clear()
-            self._vertex_edit_item = None
-
     def _run_boolean_op(self, op):
         if not self.project: return
         if not gdstk: QMessageBox.warning(self, "Feature Disabled", "Install 'gdstk'."); return
-        
+
         # <<< MODIFIED: Include CircleItem in the selection
         selected = [it for it in self.scene.selectedItems() if isinstance(it, (PolyItem, RectItem, CircleItem))]
-        
+
         if len(selected) < 2: self.statusBar().showMessage("Select at least two shapes for a boolean operation."); return
         first_layer = selected[0].layer.name
         if not all(it.layer.name == first_layer for it in selected):
@@ -1741,7 +1692,7 @@ class MainWindow(QMainWindow):
                 gds_polys.append(gdstk.Polygon(pts))
             elif isinstance(item, PolyItem):
                 gds_polys.append(gdstk.Polygon([(p.x(), p.y()) for p in item.polygon()]))
-            
+
             # <<< ADDED: Handle CircleItem by converting it to a gdstk polygon (ellipse)
             elif isinstance(item, CircleItem):
                 r = item.rect()
@@ -1757,7 +1708,7 @@ class MainWindow(QMainWindow):
 
         active_cell = self.project.cells[self.active_cell_name]
         data_to_delete = [item.data_obj for item in selected]
-        
+
         # <<< MODIFIED: Ensure both polygons and ellipses (from circles) are removed
         uuids_to_delete = {d.uuid for d in data_to_delete}
         active_cell.polygons = [p for p in active_cell.polygons if p.uuid not in uuids_to_delete]
@@ -1773,7 +1724,7 @@ class MainWindow(QMainWindow):
 # -------------------------- main --------------------------
 def main():
     app = QApplication(sys.argv)
-    
+
     app.setOrganizationName("MyCompany")
     app.setApplicationName("2D Mask Layout Editor")
 
@@ -1783,7 +1734,7 @@ def main():
     if not os.path.exists(icons_dir):
         os.makedirs(icons_dir)
         print("Created 'icons' directory. Please populate it with SVG icons for the best experience.")
-    
+
     welcome_dialog = WelcomeDialog()
     if not welcome_dialog.exec_() == QDialog.Accepted:
         sys.exit(0)
