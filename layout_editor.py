@@ -129,8 +129,8 @@ class WelcomeDialog(QDialog):
         icon_path = os.path.join(script_dir, 'icons', f'{icon_name}.svg')
         pixmap = QPixmap(icon_path)
         if pixmap.isNull():
-             pixmap = QPixmap(size, size)
-             pixmap.fill(Qt.transparent)
+                 pixmap = QPixmap(size, size)
+                 pixmap.fill(Qt.transparent)
         is_dark = self.palette().color(QPalette.Window).value() < 128
         if is_dark:
             painter = QPainter(pixmap)
@@ -488,18 +488,15 @@ class VertexHandle(QGraphicsEllipseItem):
         return super().itemChange(change, value)
 
 class SceneItemMixin:
-    """A mixin to handle shared mouse press/release logic for draggable items."""
     def __init__(self, *args, **kwargs):
-        self._drag_start_pos = QPointF()
+        pass
 
     def customMousePressEvent(self, event):
-        """Custom logic to be called by implementing classes."""
-        self._drag_start_pos = self.pos()
+        pass
 
     def customMouseReleaseEvent(self, event):
-        """Custom logic to be called by implementing classes."""
         if event.button() == Qt.LeftButton and self.flags() & QGraphicsItem.ItemIsMovable:
-            if self.pos() != self._drag_start_pos:
+            if event.scenePos() != event.buttonDownScenePos(Qt.LeftButton):
                 self.scene().views()[0].parent_win.update_data_from_item_move(self)
 
 class RectItem(QGraphicsRectItem, SceneItemMixin):
@@ -527,13 +524,6 @@ class RectItem(QGraphicsRectItem, SceneItemMixin):
     def itemChange(self, change, value):
         if change == QGraphicsItem.ItemSelectedChange:
             self.refresh_appearance(selected=bool(value))
-        elif change == QGraphicsItem.ItemPositionChange and self.scene():
-            view = self.scene().views()[0]
-            if view.parent_win.chk_snap.isChecked():
-                original_top_left = self.rect().topLeft()
-                proposed_scene_top_left = original_top_left + value
-                snapped_scene_top_left = view.snap_point(proposed_scene_top_left)
-                return snapped_scene_top_left - original_top_left
         return super().itemChange(change, value)
 
     def mouseDoubleClickEvent(self, event):
@@ -574,13 +564,6 @@ class PolyItem(QGraphicsPolygonItem, SceneItemMixin):
     def itemChange(self, change, value):
         if change == QGraphicsItem.ItemSelectedChange:
             self.refresh_appearance(selected=bool(value))
-        elif change == QGraphicsItem.ItemPositionChange and self.scene():
-            view = self.scene().views()[0]
-            if view.parent_win.chk_snap.isChecked():
-                original_top_left = self.polygon().boundingRect().topLeft()
-                proposed_scene_top_left = original_top_left + value
-                snapped_scene_top_left = view.snap_point(proposed_scene_top_left)
-                return snapped_scene_top_left - original_top_left
         return super().itemChange(change, value)
 
     def mouseDoubleClickEvent(self, event):
@@ -620,13 +603,6 @@ class CircleItem(QGraphicsEllipseItem, SceneItemMixin):
     def itemChange(self, change, value):
         if change == QGraphicsItem.ItemSelectedChange:
             self.refresh_appearance(selected=bool(value))
-        elif change == QGraphicsItem.ItemPositionChange and self.scene():
-            view = self.scene().views()[0]
-            if view.parent_win.chk_snap.isChecked():
-                original_top_left = self.rect().topLeft()
-                proposed_scene_top_left = original_top_left + value
-                snapped_scene_top_left = view.snap_point(proposed_scene_top_left)
-                return snapped_scene_top_left - original_top_left
         return super().itemChange(change, value)
 
     def mouseDoubleClickEvent(self, event):
@@ -803,10 +779,8 @@ class Canvas(QGraphicsView):
         self.parent_win.stop_vertex_edit()
         self.mode = self.MODES.get(mode_name, self.MODES["select"])
 
-        # --- FIX 1: RESTORED MOVE LOGIC ---
         is_move_mode = (self.mode == self.MODES["move"])
         is_select_mode = (self.mode == self.MODES["select"])
-        # --- End of Fix ---
 
         if is_select_mode:
             self.setDragMode(QGraphicsView.RubberBandDrag)
@@ -814,9 +788,7 @@ class Canvas(QGraphicsView):
             self.setDragMode(QGraphicsView.NoDrag)
         for item in self.scene().items():
             if item.flags() & QGraphicsItem.ItemIsSelectable:
-                # --- FIX 1 (cont.): USE CORRECT FLAGS ---
-                item.setFlag(QGraphicsItem.ItemIsMovable, is_select_mode or is_move_mode)
-                # --- End of Fix ---
+                item.setFlag(QGraphicsItem.ItemIsMovable, is_move_mode)
         self.temp_cancel()
 
     def temp_cancel(self):
@@ -1101,7 +1073,7 @@ class MainWindow(QMainWindow):
         project.refresh_layer_map()
         layer_num_to_name = {l_num: f"Layer_{l_num}" for l_num in gds_layers}
         for l_num, meta in layer_meta.items():
-             if 'name' in meta: layer_num_to_name[l_num] = meta['name']
+                 if 'name' in meta: layer_num_to_name[l_num] = meta['name']
 
         for cell in lib.cells:
             new_cell = Cell()
@@ -1405,7 +1377,7 @@ class MainWindow(QMainWindow):
         self._undo_stack.append(copy.deepcopy(self.project))
         if len(self._undo_stack) > 50: self._undo_stack.pop(0)
         if len(self._undo_stack) > 1:
-             self._mark_dirty()
+                 self._mark_dirty()
 
     def undo(self):
         if len(self._undo_stack) > 1:
@@ -1453,31 +1425,38 @@ class MainWindow(QMainWindow):
         active_cell.references.append(Ref(cell=cell_name_to_drop, origin=(origin.x(), origin.y()), magnification=magnification))
         self._save_state(); self._redraw_scene()
 
-    # --- FIX 2: RESTORED WORKING MOVE UPDATE LOGIC ---
     def update_data_from_item_move(self, item):
-        drag_start_pos = item._drag_start_pos
-        # The item's final position is already snapped by its itemChange method
-        final_pos = item.pos()
-        dx = final_pos.x() - drag_start_pos.x()
-        dy = final_pos.y() - drag_start_pos.y()
+        bounds = item.mapToScene(item.boundingRect()).boundingRect()
+        original_top_left = bounds.topLeft()
+        snapped_top_left = self.view.snap_point(original_top_left)
+        delta = snapped_top_left - original_top_left
 
-        if abs(dx) < 1e-9 and abs(dy) < 1e-9:
+        if delta.x() == 0 and delta.y() == 0:
+            self._save_state() # Still save state in case of minor floating point drift
             return
 
-        # Update the underlying data model based on the delta
         if isinstance(item, RefItem):
-            item.ref.origin = (item.ref.origin[0] + dx, item.ref.origin[1] + dy)
-        elif isinstance(item, CircleItem):
-            r = item.data_obj.rect
-            item.data_obj.rect = (r[0] + dx, r[1] + dy, r[2], r[3])
-        elif isinstance(item, (RectItem, PolyItem)):
-            item.data_obj.points = [(p[0] + dx, p[1] + dy) for p in item.data_obj.points]
+            final_pos = item.pos() + delta
+            item.ref.origin = (final_pos.x(), final_pos.y())
 
-        # The item's visual position is already correct. We just need to save the state.
-        # No need to redraw or reset the item's position.
+        elif isinstance(item, CircleItem):
+            final_scene_rect = item.mapToScene(item.rect()).boundingRect()
+            final_scene_rect.translate(delta)
+            item.data_obj.rect = (final_scene_rect.x(), final_scene_rect.y(), final_scene_rect.width(), final_scene_rect.height())
+
+        elif isinstance(item, (PolyItem, RectItem)):
+            if isinstance(item, RectItem):
+                r = item.rect()
+                local_poly = QPolygonF([r.topLeft(), r.topRight(), r.bottomRight(), r.bottomLeft()])
+            else: # PolyItem
+                local_poly = item.polygon()
+
+            final_scene_poly = item.mapToScene(local_poly)
+            snapped_points = [(p.x() + delta.x(), p.y() + delta.y()) for p in final_scene_poly]
+            item.data_obj.points = snapped_points
+
         self._save_state()
-        self._redraw_scene() # Redraw to ensure all states are consistent
-    # --- End of Fix ---
+        self._redraw_scene()
 
     def update_data_from_item_edit(self, item):
         if isinstance(item, RectItem):
