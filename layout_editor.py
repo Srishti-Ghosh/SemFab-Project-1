@@ -32,7 +32,7 @@ from PyQt5.QtWidgets import (
     QGraphicsItem, QToolBar, QPushButton, QLabel, QLineEdit,
     QSpinBox, QCheckBox, QDialog, QVBoxLayout, QDialogButtonBox, QToolTip,
     QDockWidget, QListWidget, QListWidgetItem, QWidget, QHBoxLayout, QMessageBox, QDoubleSpinBox, QGraphicsEllipseItem,
-    QInputDialog, QTabWidget, QFrame, QToolButton, QGridLayout, QSlider, QGraphicsLineItem
+    QInputDialog, QTabWidget, QFrame, QToolButton, QGridLayout, QSlider, QGraphicsLineItem, QMenu, QGraphicsSceneMouseEvent
 )
 from PyQt5.QtSvg import QSvgGenerator
 
@@ -423,33 +423,25 @@ class ThreeDViewDialog(QDialog):
 
         total_height = max(height_map.values()) if height_map else 0
 
-        # --- NEW CODE START: Add a translucent bounding box ---
         if total_height > 0:
             w = max_x - min_x
             h = max_y - min_y
             d = total_height
 
-            # Define the 8 vertices of the box, centered like the model
             v = [
-                (-w/2, -h/2, 0), (w/2, -h/2, 0), (w/2, h/2, 0), (-w/2, h/2, 0), # Bottom
-                (-w/2, -h/2, d), (w/2, -h/2, d), (w/2, h/2, d), (-w/2, h/2, d)  # Top
+                (-w/2, -h/2, 0), (w/2, -h/2, 0), (w/2, h/2, 0), (-w/2, h/2, 0),
+                (-w/2, -h/2, d), (w/2, -h/2, d), (w/2, h/2, d), (-w/2, h/2, d)
             ]
 
-            # Define the 6 faces using vertex indices
             box_faces_indices = [
-                (0, 1, 2, 3),  # Bottom
-                (4, 5, 6, 7),  # Top
-                (0, 3, 7, 4),  # Left
-                (1, 2, 6, 5),  # Right
-                (0, 1, 5, 4),  # Back
-                (2, 3, 7, 6)   # Front
+                (0, 1, 2, 3), (4, 5, 6, 7), (0, 3, 7, 4),
+                (1, 2, 6, 5), (0, 1, 5, 4), (2, 3, 7, 6)
             ]
 
-            box_color = QColor(150, 150, 150, 40) # A light, translucent gray
+            box_color = QColor(150, 150, 150, 40)
             for face_indices in box_faces_indices:
                 face_points = [v[i] for i in face_indices]
                 all_faces.append((face_points, box_color))
-        # --- NEW CODE END ---
 
         all_faces.sort(key=lambda face: sum(self.project_point(*p).y() for p in face[0])/len(face[0]))
 
@@ -511,11 +503,10 @@ class RectItem(QGraphicsRectItem, SceneItemMixin):
         return super().itemChange(change, value)
 
     def mouseDoubleClickEvent(self, event):
-        super().mouseDoubleClickEvent(event); r = self.rect()
-        dlg = ShapeEditDialog("rect", {"x": r.x(), "y": r.y(), "w": r.width(), "h": r.height()}, self.scene().views()[0])
-        if dlg.exec_() == QDialog.Accepted and (vals := dlg.get_values()):
-            self.setRect(QRectF(vals["x"], vals["y"], vals["w"], vals["h"]))
-            self.scene().views()[0].parent_win.update_data_from_item_edit(self)
+        if event is None:
+            event = QGraphicsSceneMouseEvent()
+        super().mouseDoubleClickEvent(event)
+        self.scene().views()[0].parent_win.show_properties_dialog_for_item(self)
 
 class PolyItem(QGraphicsPolygonItem, SceneItemMixin):
     def __init__(self, poly, layer, data_obj, selectable=True):
@@ -545,11 +536,10 @@ class PolyItem(QGraphicsPolygonItem, SceneItemMixin):
         return super().itemChange(change, value)
 
     def mouseDoubleClickEvent(self, event):
-        super().mouseDoubleClickEvent(event); pts = [(p.x(), p.y()) for p in self.polygon()]
-        dlg = ShapeEditDialog("poly", {"points": pts}, self.scene().views()[0])
-        if dlg.exec_() == QDialog.Accepted and (vals := dlg.get_values()):
-            self.setPolygon(QPolygonF([QPointF(x, y) for x, y in vals["points"]]))
-            self.scene().views()[0].parent_win.update_data_from_item_edit(self)
+        if event is None:
+            event = QGraphicsSceneMouseEvent()
+        super().mouseDoubleClickEvent(event)
+        self.scene().views()[0].parent_win.show_properties_dialog_for_item(self)
 
 class CircleItem(QGraphicsEllipseItem, SceneItemMixin):
     def __init__(self, rect, layer, data_obj, selectable=True):
@@ -578,13 +568,10 @@ class CircleItem(QGraphicsEllipseItem, SceneItemMixin):
         return super().itemChange(change, value)
 
     def mouseDoubleClickEvent(self, event):
-        super().mouseDoubleClickEvent(event); r = self.rect()
-        params = {"center_x": r.center().x(), "center_y": r.center().y(), "w": r.width(), "h": r.height()}
-        dlg = ShapeEditDialog("circle", params, self.scene().views()[0])
-        if dlg.exec_() == QDialog.Accepted and (vals := dlg.get_values()):
-            cx, cy, w, h = vals["center_x"], vals["center_y"], vals["w"], vals["h"]
-            self.setRect(QRectF(cx - w / 2, cy - h / 2, w, h))
-            self.scene().views()[0].parent_win.update_data_from_item_edit(self)
+        if event is None:
+            event = QGraphicsSceneMouseEvent()
+        super().mouseDoubleClickEvent(event)
+        self.scene().views()[0].parent_win.show_properties_dialog_for_item(self)
 
 class RefItem(QGraphicsItem):
     def __init__(self, ref, cell, project, selectable=True):
@@ -798,6 +785,35 @@ class Canvas(QGraphicsView):
                 else: self.temp_item = self.scene().addRect(poly.boundingRect(), QPen(Qt.gray, 0, Qt.DashLine))
             event.accept(); return
         super().mousePressEvent(event)
+
+    def contextMenuEvent(self, event):
+        item = self.itemAt(event.pos())
+        if not isinstance(item, (RectItem, PolyItem, CircleItem, RefItem)):
+            return
+
+        if not item.isSelected():
+            self.scene().clearSelection()
+            item.setSelected(True)
+
+        menu = QMenu(self)
+
+        prop_action = menu.addAction("Properties...")
+        prop_action.triggered.connect(lambda: self.parent_win.show_properties_dialog_for_item(item))
+
+        rename_action = menu.addAction("Rename...")
+        rename_action.triggered.connect(self.parent_win.rename_selected_shape)
+
+        menu.addSeparator()
+
+        copy_action = menu.addAction("Copy")
+        copy_action.triggered.connect(self.parent_win.copy_selected_shapes)
+
+        menu.addSeparator()
+
+        delete_action = menu.addAction("Delete")
+        delete_action.triggered.connect(self.parent_win.delete_selected_items)
+
+        menu.exec_(event.globalPos())
 
     def mouseMoveEvent(self, event):
         scene_pos = self.mapToScene(event.pos())
@@ -1138,7 +1154,6 @@ class MainWindow(QMainWindow):
 
     def _create_themed_icon(self, icon_name):
         try:
-            # Fallback to current working directory if __file__ is not available (e.g., in an interactive environment)
             script_dir = os.path.dirname(os.path.abspath(__file__)) if "__file__" in locals() else os.getcwd()
             icon_path = os.path.join(script_dir, 'icons', f'{icon_name}.svg')
             pixmap = QPixmap(icon_path)
@@ -1156,26 +1171,30 @@ class MainWindow(QMainWindow):
 
     def _build_ui(self):
         self.tool_buttons = {}
-        self._build_menus(); self._build_tool_tabs()
+        self._create_shortcuts()
+        self._build_tool_tabs()
         self._build_cell_dock(); self._build_layer_dock()
         self.set_active_tool("select")
 
-    def _build_menus(self):
-        menu = self.menuBar()
-        file_menu = menu.addMenu("&File")
-        file_menu.addAction("New", self.new_doc, "Ctrl+N")
-        file_menu.addAction("Open...", self.open_file, "Ctrl+O")
-        file_menu.addAction("Save", self.save_json, "Ctrl+S")
-        file_menu.addAction("Save As...", self.save_json_as, "Ctrl+Shift+S")
-        file_menu.addSeparator()
-        if gdstk:
-            file_menu.addAction("Export GDS…", lambda: self._write_gdstk(False))
-            file_menu.addAction("Export OAS…", lambda: self._write_gdstk(True))
-        file_menu.addAction("Export SVG…", self.export_svg)
-        file_menu.addSeparator()
-        file_menu.addAction("Undo", self.undo, "Ctrl+Z")
-        file_menu.addAction("Redo", self.redo, "Ctrl+Y")
-        file_menu.addSeparator(); file_menu.addAction("Quit", self.close, "Ctrl+Q")
+    def _create_shortcuts(self):
+        """Creates keyboard shortcuts without a visible menubar."""
+        shortcuts = [
+            ("New", "Ctrl+N", self.new_doc),
+            ("Open...", "Ctrl+O", self.open_file),
+            ("Save", "Ctrl+S", self.save_json),
+            ("Save As...", "Ctrl+Shift+S", self.save_json_as),
+            ("Undo", "Ctrl+Z", self.undo),
+            ("Redo", "Ctrl+Y", self.redo),
+            ("Copy", "Ctrl+C", self.copy_selected_shapes),
+            ("Paste", "Ctrl+V", self.paste_shapes),
+            ("Quit", "Ctrl+Q", self.close),
+        ]
+
+        for text, shortcut, slot in shortcuts:
+            action = QAction(text, self)
+            action.setShortcut(shortcut)
+            action.triggered.connect(slot)
+            self.addAction(action)
 
     def _build_tool_tabs(self):
         dock = QDockWidget(self); dock.setTitleBarWidget(QWidget()); dock.setAllowedAreas(Qt.TopDockWidgetArea | Qt.BottomDockWidgetArea)
@@ -1183,10 +1202,33 @@ class MainWindow(QMainWindow):
 
         main_tab = QWidget(); main_layout = QHBoxLayout(main_tab)
         main_layout.setAlignment(Qt.AlignLeft); main_layout.setContentsMargins(0, 5, 0, 5)
-        main_layout.addWidget(self._create_ribbon_group("File", [
-            self._create_action_button("Save", "save", self.save_json),
+
+        export_button = QToolButton()
+        export_button.setText("Export")
+        export_button.setIcon(self._create_themed_icon("upload"))
+        export_button.setIconSize(QSize(24, 24))
+        export_button.setToolButtonStyle(Qt.ToolButtonTextUnderIcon)
+        export_button.setPopupMode(QToolButton.MenuButtonPopup)
+        
+        export_menu = QMenu(self)
+        
+        if gdstk:
+            gds_action = QAction("Export GDS...", self)
+            gds_action.triggered.connect(lambda: self._write_gdstk(False))
+            export_menu.addAction(gds_action)
+            oas_action = QAction("Export OAS...", self)
+            oas_action.triggered.connect(lambda: self._write_gdstk(True))
+            export_menu.addAction(oas_action)
+        svg_action = QAction("Export SVG...", self)
+        svg_action.triggered.connect(self.export_svg)
+        export_menu.addAction(svg_action)
+        export_button.setMenu(export_menu)
+
+        main_layout.addWidget(self._create_ribbon_group("Project", [
+            self._create_action_button("New", "file-plus", self.new_doc),
             self._create_action_button("Open", "folder", self.open_file),
-            self._create_action_button("Refresh", "refresh-cw", self._redraw_scene)
+            self._create_action_button("Save", "save", self.save_json),
+            export_button
         ]))
         main_layout.addWidget(self._create_ribbon_group("Selection", [
             self._create_tool_button("select", "Select", "mouse-pointer"),
@@ -1212,12 +1254,12 @@ class MainWindow(QMainWindow):
         draw_layout.addWidget(self._create_ribbon_group("Create", [
             self._create_tool_button("rect", "Rect", "square"),
             self._create_tool_button("circle", "Circle", "circle"),
-            self._create_tool_button("poly", "Poly", "pen-tool")
+            self._create_tool_button("poly", "Poly", "pen-tool"),
+            self._create_action_button("Finish Poly", "check-square", lambda: self.view.finish_polygon())
         ]))
         draw_layout.addWidget(self._create_ribbon_group("Modify", [
             self._create_action_button("Rename", "tag", self.rename_selected_shape),
             self._create_action_button("Re-snap", "grid", self.resnap_all_items_to_grid),
-            self._create_action_button("Finish Poly", "check-square", lambda: self.view.finish_polygon()),
             self._create_action_button("Fillet", "git-commit", self.fillet_selected_poly)
         ]))
         draw_layout.addWidget(self._create_ribbon_group("Boolean", [
@@ -1229,11 +1271,26 @@ class MainWindow(QMainWindow):
 
         view_tab = QWidget(); view_layout = QHBoxLayout(view_tab)
         view_layout.setAlignment(Qt.AlignLeft); view_layout.setContentsMargins(0, 5, 0, 5)
+        
+        toggle_rulers_btn = self._create_action_button("Rulers", "table", lambda checked: self.toggle_rulers(checked))
+        toggle_rulers_btn.setCheckable(True)
+        toggle_rulers_btn.setChecked(True)
+        
         view_layout.addWidget(self._create_ribbon_group("Display", [
             self._create_action_button("Fill", "maximize", self.fill_view),
             self._create_action_button("3D View", "box", self.show_3d_view),
+            toggle_rulers_btn,
             self._create_tool_button("measure", "Measure", "compass")
         ]))
+        view_layout.addWidget(self._create_ribbon_group("Zoom", [
+            self._create_action_button("Zoom In", "zoom-in", self.zoom_in),
+            self._create_action_button("Zoom Out", "zoom-out", self.zoom_out)
+        ]))
+        view_layout.addWidget(self._create_ribbon_group("Layer Visibility", [
+            self._create_action_button("Show All", "eye", self.show_all_layers),
+            self._create_action_button("Hide All", "eye-off", self.hide_all_layers)
+        ]))
+
         view_layout.addStretch(); tabs.addTab(view_tab, "View")
         self.addDockWidget(Qt.TopDockWidgetArea, dock)
 
@@ -1400,25 +1457,18 @@ class MainWindow(QMainWindow):
         delta = snapped_top_left - original_top_left
 
         if delta.x() == 0 and delta.y() == 0:
-            self._save_state() # Still save state in case of minor floating point drift
+            self._save_state()
             return
 
         if isinstance(item, RefItem):
             final_pos = item.pos() + delta
             item.ref.origin = (final_pos.x(), final_pos.y())
-
         elif isinstance(item, CircleItem):
             final_scene_rect = item.mapToScene(item.rect()).boundingRect()
             final_scene_rect.translate(delta)
             item.data_obj.rect = (final_scene_rect.x(), final_scene_rect.y(), final_scene_rect.width(), final_scene_rect.height())
-
         elif isinstance(item, (PolyItem, RectItem)):
-            if isinstance(item, RectItem):
-                r = item.rect()
-                local_poly = QPolygonF([r.topLeft(), r.topRight(), r.bottomRight(), r.bottomLeft()])
-            else: # PolyItem
-                local_poly = item.polygon()
-
+            local_poly = item.polygon() if isinstance(item, PolyItem) else QPolygonF([item.rect().topLeft(), item.rect().topRight(), item.rect().bottomRight(), item.rect().bottomLeft()])
             final_scene_poly = item.mapToScene(local_poly)
             snapped_points = [(p.x() + delta.x(), p.y() + delta.y()) for p in final_scene_poly]
             item.data_obj.points = snapped_points
@@ -1463,12 +1513,6 @@ class MainWindow(QMainWindow):
                     item.data_obj.points = gds_poly.points.tolist()
                 except Exception as e: QMessageBox.warning(self, "Fillet Error", f"Could not fillet polygon: {e}")
             self._save_state(); self._redraw_scene()
-
-    def show_measurements(self):
-        # This is a placeholder for the old show_measurements, which has been removed.
-        # The new logic is in Canvas.mouseMoveEvent for the measure tool.
-        # This can be removed or reimplemented if static measurement is needed.
-        pass
 
     def fill_view(self):
         if not self.project or not self.scene.items(): return
@@ -1643,8 +1687,6 @@ class MainWindow(QMainWindow):
             QToolButton:pressed, QToolButton:checked { background-color: palette(midlight); border: 1px solid palette(mid); }
             QLabel, QCheckBox { color: palette(text); font-size: 8pt; }
             QFrame[frameShape="5"] { color: palette(midlight); }
-            QMenuBar { background-color: palette(window); }
-            QMenuBar::item:selected { background: palette(highlight); }
         """)
 
     def rename_selected_shape(self):
@@ -1675,15 +1717,11 @@ class MainWindow(QMainWindow):
     def _run_boolean_op(self, op):
         if not self.project: return
         if not gdstk: QMessageBox.warning(self, "Feature Disabled", "Install 'gdstk'."); return
-
-        # <<< MODIFIED: Include CircleItem in the selection
         selected = [it for it in self.scene.selectedItems() if isinstance(it, (PolyItem, RectItem, CircleItem))]
-
         if len(selected) < 2: self.statusBar().showMessage("Select at least two shapes for a boolean operation."); return
         first_layer = selected[0].layer.name
         if not all(it.layer.name == first_layer for it in selected):
             QMessageBox.warning(self, "Boolean Error", "All selected shapes must be on the same layer."); return
-
         gds_polys = []
         for item in selected:
             if isinstance(item, RectItem):
@@ -1692,62 +1730,133 @@ class MainWindow(QMainWindow):
                 gds_polys.append(gdstk.Polygon(pts))
             elif isinstance(item, PolyItem):
                 gds_polys.append(gdstk.Polygon([(p.x(), p.y()) for p in item.polygon()]))
-
-            # <<< ADDED: Handle CircleItem by converting it to a gdstk polygon (ellipse)
             elif isinstance(item, CircleItem):
                 r = item.rect()
                 center = (r.center().x(), r.center().y())
                 radius = (r.width() / 2, r.height() / 2)
-                # gdstk.ellipse returns a Polygon object, which is what we need
                 gds_polys.append(gdstk.ellipse(center, radius))
-
         try:
             result_polys = gdstk.boolean(gds_polys[0], gds_polys[1:], op)
         except Exception as e:
             QMessageBox.critical(self, "Boolean Operation Failed", str(e)); return
-
         active_cell = self.project.cells[self.active_cell_name]
         data_to_delete = [item.data_obj for item in selected]
-
-        # <<< MODIFIED: Ensure both polygons and ellipses (from circles) are removed
         uuids_to_delete = {d.uuid for d in data_to_delete}
         active_cell.polygons = [p for p in active_cell.polygons if p.uuid not in uuids_to_delete]
         active_cell.ellipses = [e for e in active_cell.ellipses if e.uuid not in uuids_to_delete]
-
         for res_poly in result_polys:
             active_cell.polygons.append(Poly(layer=first_layer, points=res_poly.points.tolist()))
-
         self._save_state()
         self._redraw_scene()
+        
+    def copy_selected_shapes(self):
+        if not self.project or not self.scene.selectedItems():
+            return
+        selected_data = []
+        for item in self.scene.selectedItems():
+            if hasattr(item, 'data_obj'):
+                data_dict = asdict(item.data_obj)
+                if isinstance(item.data_obj, Poly): data_dict['type'] = 'poly'
+                elif isinstance(item.data_obj, Ellipse): data_dict['type'] = 'ellipse'
+                selected_data.append(data_dict)
+        if selected_data:
+            clipboard_data = {"layout_editor_clipboard": selected_data}
+            QApplication.clipboard().setText(json.dumps(clipboard_data, cls=ProjectEncoder))
+            self.statusBar().showMessage(f"Copied {len(selected_data)} shape(s).")
+            
+    def paste_shapes(self):
+        if not self.project: return
+        try:
+            clipboard_text = QApplication.clipboard().text()
+            data = json.loads(clipboard_text)
+            if "layout_editor_clipboard" not in data: return
+            pasted_items = data["layout_editor_clipboard"]
+            active_cell = self.project.cells[self.active_cell_name]
+            offset = self.project.grid_pitch
+            for item_data in pasted_items:
+                item_data.pop('uuid', None)
+                item_type = item_data.pop('type', None)
+                if item_type == 'poly':
+                    item_data['points'] = [(p[0] + offset, p[1] + offset) for p in item_data['points']]
+                    active_cell.polygons.append(Poly(**item_data))
+                elif item_type == 'ellipse':
+                    x, y, w, h = item_data['rect']
+                    item_data['rect'] = (x + offset, y + offset, w, h)
+                    active_cell.ellipses.append(Ellipse(**item_data))
+            self.statusBar().showMessage(f"Pasted {len(pasted_items)} shape(s).")
+            self._save_state()
+            self._redraw_scene()
+        except (json.JSONDecodeError, TypeError, KeyError):
+            self.statusBar().showMessage("Clipboard does not contain valid shape data.")
+
+    def zoom_in(self):
+        if hasattr(self, 'view'): self.view.scale(1.2, 1.2); self.view.zoomChanged.emit()
+    def zoom_out(self):
+        if hasattr(self, 'view'): self.view.scale(1 / 1.2, 1 / 1.2); self.view.zoomChanged.emit()
+    def show_all_layers(self):
+        if not self.project: return
+        for layer in self.project.layers: layer.visible = True
+        self._refresh_layer_list(); self._redraw_scene(); self._save_state()
+    def hide_all_layers(self):
+        if not self.project: return
+        for layer in self.project.layers: layer.visible = False
+        self._refresh_layer_list(); self._redraw_scene(); self._save_state()
+    def toggle_rulers(self, checked):
+        if hasattr(self, 'canvas_container'):
+            self.canvas_container.h_ruler.setVisible(checked)
+            self.canvas_container.v_ruler.setVisible(checked)
+
+    def show_properties_dialog_for_item(self, item):
+        """Opens the correct properties dialog for the given graphics item."""
+        if not item or not hasattr(item, 'data_obj'): return
+        if isinstance(item, (RectItem, PolyItem)):
+            if isinstance(item, RectItem):
+                r = item.rect()
+                kind, params = "rect", {"x": r.x(), "y": r.y(), "w": r.width(), "h": r.height()}
+            else:
+                pts = [(p.x(), p.y()) for p in item.polygon()]
+                kind, params = "poly", {"points": pts}
+            dlg = ShapeEditDialog(kind, params, self.view)
+            if dlg.exec_() == QDialog.Accepted and (vals := dlg.get_values()):
+                if kind == "rect": item.setRect(QRectF(vals["x"], vals["y"], vals["w"], vals["h"]))
+                else: item.setPolygon(QPolygonF([QPointF(x, y) for x, y in vals["points"]]))
+                self.update_data_from_item_edit(item)
+        elif isinstance(item, CircleItem):
+            r = item.rect()
+            params = {"center_x": r.center().x(), "center_y": r.center().y(), "w": r.width(), "h": r.height()}
+            dlg = ShapeEditDialog("circle", params, self.view)
+            if dlg.exec_() == QDialog.Accepted and (vals := dlg.get_values()):
+                cx, cy, w, h = vals["center_x"], vals["center_y"], vals["w"], vals["h"]
+                item.setRect(QRectF(cx - w / 2, cy - h / 2, w, h))
+                self.update_data_from_item_edit(item)
 
 
 # -------------------------- main --------------------------
 def main():
     app = QApplication(sys.argv)
-
     app.setOrganizationName("MyCompany")
     app.setApplicationName("2D Mask Layout Editor")
-
-    # Fallback to current working directory if __file__ is not available
     script_dir = os.path.dirname(os.path.abspath(__file__)) if "__file__" in locals() else os.getcwd()
     icons_dir = os.path.join(script_dir, 'icons')
     if not os.path.exists(icons_dir):
         os.makedirs(icons_dir)
         print("Created 'icons' directory. Please populate it with SVG icons for the best experience.")
-
     welcome_dialog = WelcomeDialog()
     if not welcome_dialog.exec_() == QDialog.Accepted:
         sys.exit(0)
-
     win = MainWindow()
     win.show()
-
     if welcome_dialog.choice == 'open':
         win.open_file(path=welcome_dialog.open_path)
     elif welcome_dialog.choice == 'new':
         win.new_doc()
-
     sys.exit(app.exec_())
+
+class ProjectEncoder(json.JSONEncoder):
+    def default(self, o):
+        if isinstance(o, UUID): return str(o)
+        if is_dataclass(o): return asdict(o)
+        return super().default(o)
 
 if __name__ == "__main__":
     main()
