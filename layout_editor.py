@@ -1694,7 +1694,10 @@ class MainWindow(QMainWindow):
     def _run_boolean_op(self, op):
         if not self.project: return
         if not gdstk: QMessageBox.warning(self, "Feature Disabled", "Install 'gdstk'."); return
-        selected = [it for it in self.scene.selectedItems() if isinstance(it, (PolyItem, RectItem))]
+        
+        # <<< MODIFIED: Include CircleItem in the selection
+        selected = [it for it in self.scene.selectedItems() if isinstance(it, (PolyItem, RectItem, CircleItem))]
+        
         if len(selected) < 2: self.statusBar().showMessage("Select at least two shapes for a boolean operation."); return
         first_layer = selected[0].layer.name
         if not all(it.layer.name == first_layer for it in selected):
@@ -1708,6 +1711,14 @@ class MainWindow(QMainWindow):
                 gds_polys.append(gdstk.Polygon(pts))
             elif isinstance(item, PolyItem):
                 gds_polys.append(gdstk.Polygon([(p.x(), p.y()) for p in item.polygon()]))
+            
+            # <<< ADDED: Handle CircleItem by converting it to a gdstk polygon (ellipse)
+            elif isinstance(item, CircleItem):
+                r = item.rect()
+                center = (r.center().x(), r.center().y())
+                radius = (r.width() / 2, r.height() / 2)
+                # gdstk.ellipse returns a Polygon object, which is what we need
+                gds_polys.append(gdstk.ellipse(center, radius))
 
         try:
             result_polys = gdstk.boolean(gds_polys[0], gds_polys[1:], op)
@@ -1716,7 +1727,11 @@ class MainWindow(QMainWindow):
 
         active_cell = self.project.cells[self.active_cell_name]
         data_to_delete = [item.data_obj for item in selected]
-        active_cell.polygons = [p for p in active_cell.polygons if p.uuid not in [d.uuid for d in data_to_delete]]
+        
+        # <<< MODIFIED: Ensure both polygons and ellipses (from circles) are removed
+        uuids_to_delete = {d.uuid for d in data_to_delete}
+        active_cell.polygons = [p for p in active_cell.polygons if p.uuid not in uuids_to_delete]
+        active_cell.ellipses = [e for e in active_cell.ellipses if e.uuid not in uuids_to_delete]
 
         for res_poly in result_polys:
             active_cell.polygons.append(Poly(layer=first_layer, points=res_poly.points.tolist()))
