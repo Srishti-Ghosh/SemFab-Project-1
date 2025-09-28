@@ -1206,65 +1206,68 @@ class MainWindow(QMainWindow):
         file_menu.addSeparator(); file_menu.addAction("Quit", self.close, "Ctrl+Q")
 
     def _build_tool_tabs(self):
-        dock = QDockWidget(self); dock.setTitleBarWidget(QWidget()); dock.setAllowedAreas(Qt.TopDockWidgetArea | Qt.BottomDockWidgetArea)
-        dock.setFeatures(QDockWidget.DockWidgetMovable); tabs = QTabWidget(); dock.setWidget(tabs)
+            dock = QDockWidget(self); dock.setTitleBarWidget(QWidget()); dock.setAllowedAreas(Qt.TopDockWidgetArea | Qt.BottomDockWidgetArea)
+            dock.setFeatures(QDockWidget.DockWidgetMovable); tabs = QTabWidget(); dock.setWidget(tabs)
 
-        main_tab = QWidget(); main_layout = QHBoxLayout(main_tab)
-        main_layout.setAlignment(Qt.AlignLeft); main_layout.setContentsMargins(0, 5, 0, 5)
-        main_layout.addWidget(self._create_ribbon_group("File", [
-            self._create_action_button("Save", "save", self.save_json),
-            self._create_action_button("Open", "folder", self.open_file),
-            self._create_action_button("Refresh", "refresh-cw", self._redraw_scene)
-        ]))
-        main_layout.addWidget(self._create_ribbon_group("Selection", [
-            self._create_tool_button("select", "Select", "mouse-pointer"),
-            self._create_tool_button("move", "Move", "move")
-        ]))
-        main_layout.addWidget(self._create_ribbon_group("History", [
-            self._create_action_button("Delete", "trash-2", self.delete_selected_items),
-            self._create_action_button("Undo", "corner-up-left", self.undo),
-            self._create_action_button("Redo", "corner-up-right", self.redo)
-        ]))
-        grid_widget = QWidget(); grid_layout = QVBoxLayout(grid_widget)
-        self.chk_snap = QCheckBox("Snap"); self.chk_snap.setChecked(True)
-        self.spin_grid = QSpinBox(); self.spin_grid.setRange(1, 1000)
-        self.spin_grid.valueChanged.connect(self.set_grid_pitch)
-        grid_layout.addWidget(self.chk_snap); grid_size_layout = QHBoxLayout()
-        grid_size_layout.addWidget(QLabel("Grid:")); grid_size_layout.addWidget(self.spin_grid)
-        grid_layout.addLayout(grid_size_layout)
-        main_layout.addWidget(self._create_ribbon_group("Grid", [grid_widget]))
-        main_layout.addStretch(); tabs.addTab(main_tab, "Main")
+            main_tab = QWidget(); main_layout = QHBoxLayout(main_tab)
+            # ... (rest of the main tab is unchanged) ...
+            main_layout.setAlignment(Qt.AlignLeft); main_layout.setContentsMargins(0, 5, 0, 5)
+            main_layout.addWidget(self._create_ribbon_group("File", [
+                self._create_action_button("Save", "save", self.save_json),
+                self._create_action_button("Open", "folder", self.open_file),
+                self._create_action_button("Refresh", "refresh-cw", self._redraw_scene)
+            ]))
+            main_layout.addWidget(self._create_ribbon_group("Selection", [
+                self._create_tool_button("select", "Select", "mouse-pointer"),
+                self._create_tool_button("move", "Move", "move")
+            ]))
+            main_layout.addWidget(self._create_ribbon_group("History", [
+                self._create_action_button("Delete", "trash-2", self.delete_selected_items),
+                self._create_action_button("Undo", "corner-up-left", self.undo),
+                self._create_action_button("Redo", "corner-up-right", self.redo)
+            ]))
+            grid_widget = QWidget(); grid_layout = QVBoxLayout(grid_widget)
+            self.chk_snap = QCheckBox("Snap"); self.chk_snap.setChecked(True)
+            self.spin_grid = QSpinBox(); self.spin_grid.setRange(1, 1000)
+            self.spin_grid.valueChanged.connect(self.set_grid_pitch)
+            grid_layout.addWidget(self.chk_snap); grid_size_layout = QHBoxLayout()
+            grid_size_layout.addWidget(QLabel("Grid:")); grid_size_layout.addWidget(self.spin_grid)
+            grid_layout.addLayout(grid_size_layout)
+            main_layout.addWidget(self._create_ribbon_group("Grid", [grid_widget]))
+            main_layout.addStretch(); tabs.addTab(main_tab, "Main")
 
-        draw_tab = QWidget(); draw_layout = QHBoxLayout(draw_tab)
-        draw_layout.setAlignment(Qt.AlignLeft); draw_layout.setContentsMargins(0, 5, 0, 5)
-        draw_layout.addWidget(self._create_ribbon_group("Create", [
-            self._create_tool_button("rect", "Rect", "square"),
-            self._create_tool_button("circle", "Circle", "circle"),
-            self._create_tool_button("poly", "Poly", "pen-tool")
-        ]))
-        draw_layout.addWidget(self._create_ribbon_group("Modify", [
-            self._create_action_button("Rename", "tag", self.rename_selected_shape),
-            self._create_tool_button("vertex_edit", "Vertex Edit", "git-pull-request"),
-            self._create_action_button("Re-snap", "grid", self.resnap_all_items_to_grid),
-            self._create_action_button("Finish Poly", "check-square", lambda: self.view.finish_polygon()),
-            self._create_action_button("Fillet", "git-commit", self.fillet_selected_poly)
-        ]))
-        draw_layout.addWidget(self._create_ribbon_group("Boolean", [
-            self._create_action_button("Union", "plus-square", lambda: self._run_boolean_op('union')),
-            self._create_action_button("Subtract", "minus-square", lambda: self._run_boolean_op('not')),
-            self._create_action_button("Intersect", "crop", lambda: self._run_boolean_op('and'))
-        ]))
-        draw_layout.addStretch(); tabs.addTab(draw_tab, "Draw")
 
-        view_tab = QWidget(); view_layout = QHBoxLayout(view_tab)
-        view_layout.setAlignment(Qt.AlignLeft); view_layout.setContentsMargins(0, 5, 0, 5)
-        view_layout.addWidget(self._create_ribbon_group("Display", [
-            self._create_action_button("Fill", "maximize", self.fill_view),
-            self._create_action_button("3D View", "box", self.show_3d_view),
-            self._create_tool_button("measure", "Measure", "compass")
-        ]))
-        view_layout.addStretch(); tabs.addTab(view_tab, "View")
-        self.addDockWidget(Qt.TopDockWidgetArea, dock)
+            draw_tab = QWidget(); draw_layout = QHBoxLayout(draw_tab)
+            draw_layout.setAlignment(Qt.AlignLeft); draw_layout.setContentsMargins(0, 5, 0, 5)
+            draw_layout.addWidget(self._create_ribbon_group("Create", [
+                self._create_tool_button("rect", "Rect", "square"),
+                self._create_tool_button("circle", "Circle", "circle"),
+                self._create_tool_button("poly", "Poly", "pen-tool")
+            ]))
+            draw_layout.addWidget(self._create_ribbon_group("Modify", [
+                self._create_action_button("Rename", "tag", self.rename_selected_shape),
+                self._create_tool_button("vertex_edit", "Vertex Edit", "git-pull-request"),
+                self._create_action_button("Re-snap", "grid", self.resnap_all_items_to_grid),
+                self._create_action_button("Finish Poly", "check-square", lambda: self.view.finish_polygon()),
+                self._create_action_button("Fillet", "git-commit", self.fillet_selected_poly)
+            ]))
+            draw_layout.addWidget(self._create_ribbon_group("Boolean", [
+                # --- THIS LINE IS THE FIX ---
+                self._create_action_button("Union", "plus-square", lambda: self._run_boolean_op('or')),
+                self._create_action_button("Subtract", "minus-square", lambda: self._run_boolean_op('not')),
+                self._create_action_button("Intersect", "crop", lambda: self._run_boolean_op('and'))
+            ]))
+            draw_layout.addStretch(); tabs.addTab(draw_tab, "Draw")
+
+            view_tab = QWidget(); view_layout = QHBoxLayout(view_tab)
+            view_layout.setAlignment(Qt.AlignLeft); view_layout.setContentsMargins(0, 5, 0, 5)
+            view_layout.addWidget(self._create_ribbon_group("Display", [
+                self._create_action_button("Fill", "maximize", self.fill_view),
+                self._create_action_button("3D View", "box", self.show_3d_view),
+                self._create_tool_button("measure", "Measure", "compass")
+            ]))
+            view_layout.addStretch(); tabs.addTab(view_tab, "View")
+            self.addDockWidget(Qt.TopDockWidgetArea, dock)
 
     def _create_tool_button(self, tool_name, text, icon_name):
         button = QToolButton(); button.setText(text); button.setIcon(self._create_themed_icon(icon_name))
@@ -1435,24 +1438,15 @@ class MainWindow(QMainWindow):
             return
 
         if isinstance(item, RefItem):
-            old_origin = item.ref.origin
-            item.ref.origin = (old_origin[0] + dx, old_origin[1] + dy)
+            item.ref.origin = (item.ref.origin[0] + dx, item.ref.origin[1] + dy)
         elif isinstance(item, CircleItem):
-            old_rect = item.data_obj.rect
-            item.data_obj.rect = (old_rect[0] + dx, old_rect[1] + dy, old_rect[2], old_rect[3])
+            r = item.data_obj.rect
+            item.data_obj.rect = (r[0] + dx, r[1] + dy, r[2], r[3])
         elif isinstance(item, (RectItem, PolyItem)):
             item.data_obj.points = [(p[0] + dx, p[1] + dy) for p in item.data_obj.points]
 
-        if isinstance(item, (RectItem, PolyItem)):
-            new_points = [QPointF(p[0], p[1]) for p in item.data_obj.points]
-            item.setPolygon(QPolygonF(new_points))
-            item.setPos(0, 0)
-        elif isinstance(item, CircleItem):
-            r = item.data_obj.rect
-            item.setRect(QRectF(r[0], r[1], r[2], r[3]))
-            item.setPos(0, 0)
-
         self._save_state()
+        self._redraw_scene() # Redraw to ensure all states are consistent
 
     def update_data_from_item_edit(self, item):
         if isinstance(item, RectItem):
@@ -1730,37 +1724,46 @@ class MainWindow(QMainWindow):
             self._vertex_edit_item = None
 
     def _run_boolean_op(self, op):
-        if not self.project: return
-        if not gdstk: QMessageBox.warning(self, "Feature Disabled", "Install 'gdstk'."); return
-        selected = [it for it in self.scene.selectedItems() if isinstance(it, (PolyItem, RectItem))]
-        if len(selected) < 2: self.statusBar().showMessage("Select at least two shapes for a boolean operation."); return
-        first_layer = selected[0].layer.name
-        if not all(it.layer.name == first_layer for it in selected):
-            QMessageBox.warning(self, "Boolean Error", "All selected shapes must be on the same layer."); return
+            if not self.project: return
+            if not gdstk:
+                QMessageBox.warning(self, "Feature Disabled", "Please install 'gdstk' to use this feature.")
+                return
 
-        gds_polys = []
-        for item in selected:
-            if isinstance(item, RectItem):
-                r = item.rect()
-                pts = [(r.left(), r.top()),(r.right(), r.top()),(r.right(), r.bottom()),(r.left(), r.bottom())]
-                gds_polys.append(gdstk.Polygon(pts))
-            elif isinstance(item, PolyItem):
-                gds_polys.append(gdstk.Polygon([(p.x(), p.y()) for p in item.polygon()]))
+            selected = [it for it in self.scene.selectedItems() if isinstance(it, (PolyItem, RectItem))]
+            if len(selected) < 2:
+                self.statusBar().showMessage("Select at least two shapes for a boolean operation.")
+                return
 
-        try:
-            result_polys = gdstk.boolean(gds_polys[0], gds_polys[1:], op)
-        except Exception as e:
-            QMessageBox.critical(self, "Boolean Operation Failed", str(e)); return
+            first_layer = selected[0].layer.name
+            if not all(it.layer.name == first_layer for it in selected):
+                QMessageBox.warning(self, "Boolean Error", "All selected shapes must be on the same layer.")
+                return
 
-        active_cell = self.project.cells[self.active_cell_name]
-        data_to_delete = [item.data_obj for item in selected]
-        active_cell.polygons = [p for p in active_cell.polygons if p.uuid not in [d.uuid for d in data_to_delete]]
+            gds_polys = []
+            for item in selected:
+                if isinstance(item, RectItem):
+                    r = item.rect()
+                    pts = [(r.left(), r.top()), (r.right(), r.top()), (r.right(), r.bottom()), (r.left(), r.bottom())]
+                    gds_polys.append(gdstk.Polygon(pts))
+                elif isinstance(item, PolyItem):
+                    gds_polys.append(gdstk.Polygon([(p.x(), p.y()) for p in item.polygon()]))
 
-        for res_poly in result_polys:
-            active_cell.polygons.append(Poly(layer=first_layer, points=res_poly.points.tolist()))
+            try:
+                result_polys = gdstk.boolean(gds_polys[0], gds_polys[1:], op)
 
-        self._save_state()
-        self._redraw_scene()
+            except Exception as e:
+                QMessageBox.critical(self, "Boolean Operation Failed", str(e))
+                return
+
+            active_cell = self.project.cells[self.active_cell_name]
+            data_to_delete = [item.data_obj for item in selected]
+            active_cell.polygons = [p for p in active_cell.polygons if p.uuid not in [d.uuid for d in data_to_delete]]
+
+            for res_poly in result_polys:
+                active_cell.polygons.append(Poly(layer=first_layer, points=res_poly.points.tolist()))
+
+            self._save_state()
+            self._redraw_scene()
 
 
 # -------------------------- main --------------------------
