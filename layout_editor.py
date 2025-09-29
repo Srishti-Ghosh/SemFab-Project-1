@@ -23,9 +23,9 @@ except ImportError:
     print("Warning: matplotlib library not found. 3D view will be disabled.")
     Path = None
 
-from PyQt5.QtCore import Qt, QRectF, QPointF, QSize, QMimeData, pyqtSignal, QLineF
+from PyQt5.QtCore import Qt, QRectF, QPointF, QSize, QMimeData, pyqtSignal, QLineF, QUrl
 from PyQt5.QtGui import (QBrush, QPen, QColor, QPolygonF, QPainter, QPixmap, QIcon, QPainterPath,
-                         QDrag, QPalette, QFont, QTransform)
+                         QDrag, QPalette, QFont, QTransform, QDesktopServices)
 from PyQt5.QtWidgets import (
     QApplication, QMainWindow, QAction, QFileDialog, QColorDialog,
     QGraphicsView, QGraphicsScene, QGraphicsRectItem, QGraphicsPolygonItem,
@@ -972,6 +972,22 @@ class MainWindow(QMainWindow):
         self.statusBar().showMessage("Welcome!")
         self.resize(1600, 1000)
 
+    def show_help_pdf(self):
+        """Finds and opens the user guide PDF."""
+        try:
+            script_dir = os.path.dirname(os.path.abspath(__file__))
+        except NameError:
+            script_dir = os.getcwd()
+
+        pdf_path = os.path.join(script_dir, 'docs', 'user_guide.pdf')
+
+        if os.path.exists(pdf_path):
+            QDesktopServices.openUrl(QUrl.fromLocalFile(pdf_path))
+        else:
+            QMessageBox.warning(self, "Help Not Found",
+                                f"Could not find the user guide.\n"
+                                f"Expected location: {pdf_path}")
+
     def initialize_project(self, project):
         self.project = project
         self.active_cell_name = self.project.top
@@ -1247,6 +1263,9 @@ class MainWindow(QMainWindow):
         grid_size_layout.addWidget(QLabel("Grid:")); grid_size_layout.addWidget(self.spin_grid)
         grid_layout.addLayout(grid_size_layout)
         main_layout.addWidget(self._create_ribbon_group("Grid", [grid_widget]))
+        main_layout.addWidget(self._create_ribbon_group("Help", [
+            self._create_action_button("User Guide", "help-circle", self.show_help_pdf)
+        ]))
         main_layout.addStretch(); tabs.addTab(main_tab, "Main")
 
         draw_tab = QWidget(); draw_layout = QHBoxLayout(draw_tab)
@@ -1357,7 +1376,8 @@ class MainWindow(QMainWindow):
         self.list_cells.setDragEnabled(True)
         self.list_cells.itemDoubleClicked.connect(self._on_cell_double_clicked)
         widget, layout = QWidget(), QVBoxLayout()
-        layout.addWidget(QLabel("Double-click to edit, Drag to instantiate")); layout.addWidget(self.list_cells)
+        layout.addWidget(QLabel("Double-click to edit, Drag to instantiate")); 
+        layout.addWidget(self.list_cells)
         btns = QHBoxLayout()
         for label, func in [("Add", self.add_cell_dialog), ("Rename", self.rename_cell_dialog), ("Delete", self.delete_cell_dialog)]:
             btn = QPushButton(label); btn.clicked.connect(func); btns.addWidget(btn)
