@@ -31,7 +31,7 @@ from PyQt5.QtWidgets import (
     QGraphicsView, QGraphicsScene, QGraphicsRectItem, QGraphicsPolygonItem,
     QGraphicsItem, QToolBar, QPushButton, QLabel, QLineEdit,
     QSpinBox, QCheckBox, QDialog, QVBoxLayout, QDialogButtonBox, QToolTip,
-    QDockWidget, QListWidget, QListWidgetItem, QWidget, QHBoxLayout, QMessageBox, QDoubleSpinBox, QGraphicsEllipseItem,
+    QDockWidget, QListWidget, QListWidgetItem, QWidget, QHBoxLayout, QMessageBox, QDoubleSpinBox, QGraphicsEllipseItem, QComboBox, 
     QInputDialog, QTabWidget, QFrame, QToolButton, QGridLayout, QSlider, QGraphicsLineItem, QMenu, QGraphicsSceneMouseEvent, QOpenGLWidget
 )
 from PyQt5.QtSvg import QSvgGenerator
@@ -312,7 +312,7 @@ class ThreeDViewDialog(QDialog):
         self.setGeometry(100, 100, 800, dynamic_height)
 
         self.angle_x, self.angle_y, self.zoom_scale = 35.0, -45.0, 1.0
-        self.layer_thicknesses = {layer.name: 10 for layer in self.project.layers}
+        self.layer_thicknesses = {layer.name: getattr(layer, 'thickness_3d', 10) for layer in self.project.layers}
         self.sliders = {}
 
         main_layout = QVBoxLayout(self)
@@ -325,10 +325,10 @@ class ThreeDViewDialog(QDialog):
         row = 1
         for layer in self.project.layers:
             label, slider = QLabel(layer.name), QSlider(Qt.Horizontal)
-            slider.setRange(1, 100); slider.setValue(self.layer_thicknesses.get(layer.name, 10))
-            slider.valueChanged.connect(
-                lambda value, name=layer.name: self.on_slider_change(name, value)
-            )
+            seed = getattr(layer, 'thickness_3d', self.layer_thicknesses.get(layer.name, 10))
+            seed_int = max(1, int(round(seed)))
+            slider.setRange(1, max(100, seed_int)); slider.setValue(seed_int)
+            slider.valueChanged.connect(self.on_slider_change)
             value_label = QLabel(f"{slider.value()}%")
             slider.value_label = value_label
             sliders_layout.addWidget(label, row, 0)
@@ -375,9 +375,15 @@ class ThreeDViewDialog(QDialog):
             QMessageBox.warning(self, "Save Error", f"Could not save image to:\n{path}")
 
     # --- CORRECTED METHOD DEFINITION ---
-    def on_slider_change(self, layer_name, new_value):
-        self.layer_thicknesses[layer_name] = new_value
-        self.sliders[layer_name].value_label.setText(f"{new_value}%")
+    def on_slider_change(self):
+        for name, slider in self.sliders.items():
+            self.layer_thicknesses[name] = slider.value()
+            slider.value_label.setText(f"{slider.value()}")
+
+            layer = next((l for l in self.project.layers if l.name == name), None)
+            if layer:
+                layer.thickness_3d = float(slider.value())
+
         self.draw_3d_view()
 
     def project_point(self, x, y, z):
@@ -420,6 +426,9 @@ class ThreeDViewDialog(QDialog):
                                                              ref.magnification * mag))
             return shapes
 
+        for layer in self.project.layers:
+            if not layer.visible or not Path: continue
+            thickness = getattr(layer, 'thickness_3d', self.layer_thicknesses.get(layer.name, 10))
         all_shapes_by_layer = {layer.name: [] for layer in self.project.layers}
         all_shapes = get_all_shapes_as_polygons(self.project.cells[self.project.top])
         if not all_shapes: return
@@ -612,6 +621,37 @@ class PolyItem(QGraphicsPolygonItem, SceneItemMixin):
         if event is None: event = QGraphicsSceneMouseEvent()
         super().mouseDoubleClickEvent(event)
         self.scene().views()[0].parent_win.show_properties_dialog_for_item(self)
+
+class ProcessDialog(QDialog):
+    def __init__(self, project, parent=None):
+        super().__init__(parent)
+        self.setWindowTitle("Simulate Process Step")
+        self.project = project
+        layout = QVBoxLayout(self)
+
+        self.step_combo = QComboBox()
+        self.step_combo.addItems(["Deposition", "Etching", "Doping"])
+        layout.addWidget(QLabel("Process Step:"))
+        layout.addWidget(self.step_combo)
+
+        self.layer_combo = QComboBox()
+        self.layer_combo.addItems([l.name for l in self.project.layers])
+        layout.addWidget(QLabel("Target Layer:"))
+        layout.addWidget(self.layer_combo)
+
+        self.param_spin = QDoubleSpinBox()
+        self.param_spin.setRange(-1000, 1000)
+        self.param_spin.setValue(10.0)
+        layout.addWidget(QLabel("Parameter (thickness or rate):"))
+        layout.addWidget(self.param_spin)
+        
+        buttons = QDialogButtonBox(QDialogButtonBox.Ok | QDialogButtonBox.Cancel)
+        buttons.accepted.connect(self.accept)
+        buttons.rejected.connect(self.reject)
+        layout.addWidget(buttons)
+
+    def get_values(self):
+        return self.step_combo.currentText(), self.layer_combo.currentText(), self.param_spin.value()
 
 class CircleItem(QGraphicsEllipseItem, SceneItemMixin):
     def __init__(self, rect, layer, data_obj, selectable=True):
@@ -1264,6 +1304,167 @@ class MainWindow(QMainWindow):
         except Exception as e: QMessageBox.critical(self, "Export Error", f"Failed to write file: {e}")
         finally: QApplication.restoreOverrideCursor()
 
+    def run_process_step(self):
+        if not self.project:
+            QMessageBox.warning(self, "No Project", "Please create or open a project first.")
+            return
+
+        dlg = ProcessDialog(self.project, self)
+        if dlg.exec_() != QDialog.Accepted:
+            return
+
+        # values is a tuple: (step, layer_name, parameter)
+        values = dlg.get_values()
+        try:
+            step, layer_name, parameter = values
+        except (TypeError, ValueError):
+            # fallback if get_values() is changed to return dict later
+            step = values.get('step')
+            layer_name = values.get('layer')
+            parameter = values.get('parameter')
+
+        # Defaults for fields not provided by the dialog
+        region = "Selected shapes only" if self.scene.selectedItems() else "All shapes on layer"
+        visual_effect = True
+
+
+        # Get the target layer
+        target_layer = self.project.layer_by_name.get(layer_name)
+        if not target_layer:
+            QMessageBox.warning(self, "Layer Not Found", f"Layer '{layer_name}' not found.")
+            return
+
+        active_cell = self.project.cells.get(self.active_cell_name)
+        if not active_cell:
+            return
+
+        # Determine which shapes to process
+        if region == "Selected shapes only" and self.scene.selectedItems():
+            shapes_to_process = [item.data_obj for item in self.scene.selectedItems() 
+                            if hasattr(item, 'data_obj') and item.data_obj.layer == layer_name]
+        else:
+            # Process all shapes on the target layer
+            shapes_to_process = [p for p in active_cell.polygons if p.layer == layer_name]
+            shapes_to_process.extend([e for e in active_cell.ellipses if e.layer == layer_name])
+
+        if not shapes_to_process:
+            QMessageBox.information(self, "No Shapes", 
+                                f"No shapes found on layer '{layer_name}' to process.")
+            return
+
+        # Apply the fabrication step
+        if step == "Deposition":
+            self._apply_deposition(layer_name, parameter, visual_effect)
+        elif step == "Etching":
+            self._apply_etching(shapes_to_process, layer_name, parameter, visual_effect)
+        elif step == "Doping":
+            self._apply_doping(shapes_to_process, layer_name, parameter, visual_effect)
+
+        self._save_state()
+        self._redraw_scene()
+
+        self.statusBar().showMessage(
+            f"Applied {step} to layer '{layer_name}' with parameter {parameter:.2f}")
+
+
+    def _apply_deposition(self, layer_name, thickness, visual_effect):
+        """Simulates deposition by adding a uniform layer."""
+        target_layer = self.project.layer_by_name.get(layer_name)
+        if not target_layer:
+            return
+
+        # Store process history as layer metadata
+        if not hasattr(target_layer, 'process_history'):
+            target_layer.process_history = []
+
+        target_layer.process_history.append({
+            'step': 'Deposition',
+            'thickness': thickness
+        })
+
+        current = getattr(target_layer, 'thickness_3d', 10)
+        target_layer.thickness_3d = max(0, current + thickness)
+
+        if visual_effect:
+            # Slightly lighten the layer color to indicate deposition
+            r, g, b = target_layer.color
+            target_layer.color = (
+                min(255, int(r * 1.1)),
+                min(255, int(g * 1.1)),
+                min(255, int(b * 1.1))
+            )
+
+        QMessageBox.information(self, "Deposition Complete",
+            f"Added {thickness:.0f} nm uniform layer on '{layer_name}'.\n"
+            f"This affects 3D visualization thickness.")
+
+
+    def _apply_etching(self, shapes_to_process, layer_name, etch_depth, visual_effect):
+        """Simulates etching by reducing or removing selected regions."""
+        target_layer = self.project.layer_by_name.get(layer_name)
+
+        # Store process history
+        if not hasattr(target_layer, 'process_history'):
+            target_layer.process_history = []
+
+        target_layer.process_history.append({
+            'step': 'Etching',
+            'depth': etch_depth,
+            'shapes_affected': len(shapes_to_process)
+        })
+
+        current = getattr(target_layer, 'thickness_3d', 10)
+        target_layer.thickness_3d = max(0, current - etch_depth)
+
+        if visual_effect:
+            # Darken the layer to indicate etching
+            r, g, b = target_layer.color
+            target_layer.color = (
+                max(0, int(r * 0.8)),
+                max(0, int(g * 0.8)),
+                max(0, int(b * 0.8))
+            )
+
+        QMessageBox.information(self, "Etching Complete",
+            f"Etched {etch_depth:.0f} nm from {len(shapes_to_process)} shape(s) on '{layer_name}'.\n"
+            f"Layer color updated to reflect etching.")
+
+
+    def _apply_doping(self, shapes_to_process, layer_name, dose, visual_effect):
+        """Simulates doping by changing color/annotation of shapes."""
+        target_layer = self.project.layer_by_name.get(layer_name)
+
+        # Store process history
+        if not hasattr(target_layer, 'process_history'):
+            target_layer.process_history = []
+
+        target_layer.process_history.append({
+            'step': 'Doping',
+            'dose': dose,
+            'shapes_affected': len(shapes_to_process)
+        })
+
+        if visual_effect:
+            # Change layer color to indicate doping (add red/orange tint)
+            r, g, b = target_layer.color
+            target_layer.color = (
+                min(255, r + 30),
+                max(0, g - 10),
+                max(0, b - 10)
+            )
+
+        # Annotate shapes with doping information
+        for shape in shapes_to_process:
+            if hasattr(shape, 'name'):
+                if shape.name:
+                    shape.name = f"{shape.name} (Doped: {dose:.1f}×10¹⁵)"
+                else:
+                    shape.name = f"Doped: {dose:.1f}×10¹⁵ cm⁻²"
+
+        QMessageBox.information(self, "Doping Complete",
+            f"Applied doping dose {dose:.1f}×10¹⁵ cm⁻² to {len(shapes_to_process)} shape(s) on '{layer_name}'.\n"
+            f"Shapes annotated with doping information.")
+
     # --- UI Building & Core Logic ---
 
     def _create_themed_icon(self, icon_name):
@@ -1421,6 +1622,8 @@ class MainWindow(QMainWindow):
             self._create_action_button("Subtract", "minus-square", lambda: self._run_boolean_op('not')),
             self._create_action_button("Intersect", "crop", lambda: self._run_boolean_op('and'))
         ]))
+        process_btn = self._create_action_button("Simulate", "cpu", self.run_process_step)
+        draw_layout.addWidget(self._create_ribbon_group("Process", [process_btn]))
         draw_layout.addStretch(); tabs.addTab(draw_tab, "Draw")
 
         view_tab = QWidget(); view_layout = QHBoxLayout(view_tab)
