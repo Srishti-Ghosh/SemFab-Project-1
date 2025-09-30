@@ -32,7 +32,7 @@ from PyQt5.QtWidgets import (
     QGraphicsItem, QToolBar, QPushButton, QLabel, QLineEdit,
     QSpinBox, QCheckBox, QDialog, QVBoxLayout, QDialogButtonBox, QToolTip,
     QDockWidget, QListWidget, QListWidgetItem, QWidget, QHBoxLayout, QMessageBox, QDoubleSpinBox, QGraphicsEllipseItem,
-    QInputDialog, QTabWidget, QFrame, QToolButton, QGridLayout, QSlider, QGraphicsLineItem, QMenu, QGraphicsSceneMouseEvent
+    QInputDialog, QTabWidget, QFrame, QToolButton, QGridLayout, QSlider, QGraphicsLineItem, QMenu, QGraphicsSceneMouseEvent, QOpenGLWidget
 )
 from PyQt5.QtSvg import QSvgGenerator
 
@@ -247,13 +247,18 @@ class ShapeEditDialog(QDialog):
         return None
 
 class FilletDialog(QDialog):
-    def __init__(self, parent=None):
+    def __init__(self, parent=None, default_radius=10.0):
         super().__init__(parent)
         self.setWindowTitle("Fillet Polygon")
         layout = QVBoxLayout(self)
         layout.addWidget(QLabel("Fillet Radius:"))
         self.radius_spin = QDoubleSpinBox()
-        self.radius_spin.setRange(0.1, 1000.0); self.radius_spin.setValue(10.0)
+        self.radius_spin.setDecimals(3) # Allow for more precision
+        self.radius_spin.setRange(0.001, 10000.0)
+        
+        # Set the spinbox's value to the passed-in default
+        self.radius_spin.setValue(default_radius)
+        
         layout.addWidget(self.radius_spin)
         buttons = QDialogButtonBox(QDialogButtonBox.Ok | QDialogButtonBox.Cancel)
         buttons.accepted.connect(self.accept); buttons.rejected.connect(self.reject)
@@ -268,6 +273,8 @@ class Interactive3DView(QGraphicsView):
         self.setRenderHint(QPainter.Antialiasing)
         self.setDragMode(QGraphicsView.NoDrag)
         self._last_pan_point = QPointF()
+        self.setViewport(QOpenGLWidget())
+        #self.setViewportUpdateMode(QGraphicsView.FullViewportUpdate)
 
     def mousePressEvent(self, event):
         if event.button() in [Qt.LeftButton, Qt.RightButton]:
@@ -296,9 +303,14 @@ class Interactive3DView(QGraphicsView):
 class ThreeDViewDialog(QDialog):
     def __init__(self, project, parent=None):
         super().__init__(parent)
-        self.setWindowTitle("Interactive 3D Preview")
-        self.setGeometry(100, 100, 800, 800)
         self.project = project
+        self.setWindowTitle("Interactive 3D Preview")
+        base_height = 500
+        height_per_layer = 30
+        num_layers = len(self.project.layers)
+        dynamic_height = base_height + (num_layers * height_per_layer)
+        self.setGeometry(100, 100, 800, dynamic_height)
+
         self.angle_x, self.angle_y, self.zoom_scale = 35.0, -45.0, 1.0
         self.layer_thicknesses = {layer.name: 10 for layer in self.project.layers}
         self.sliders = {}
@@ -309,13 +321,15 @@ class ThreeDViewDialog(QDialog):
         top_panel_layout.setContentsMargins(0, 0, 0, 0)
         sliders_frame = QFrame(); sliders_frame.setFrameShape(QFrame.StyledPanel)
         sliders_layout = QGridLayout(sliders_frame)
-        sliders_layout.addWidget(QLabel("<b>Layer Thickness</b>"), 0, 0, 1, 3)
+        sliders_layout.addWidget(QLabel("<b>Layer Thickness (%)</b>"), 0, 0, 1, 3)
         row = 1
         for layer in self.project.layers:
             label, slider = QLabel(layer.name), QSlider(Qt.Horizontal)
             slider.setRange(1, 100); slider.setValue(self.layer_thicknesses.get(layer.name, 10))
-            slider.valueChanged.connect(self.on_slider_change)
-            value_label = QLabel(f"{slider.value()}")
+            slider.valueChanged.connect(
+                lambda value, name=layer.name: self.on_slider_change(name, value)
+            )
+            value_label = QLabel(f"{slider.value()}%")
             slider.value_label = value_label
             sliders_layout.addWidget(label, row, 0)
             sliders_layout.addWidget(slider, row, 1)
@@ -342,9 +356,14 @@ class ThreeDViewDialog(QDialog):
         self.scene = QGraphicsScene()
         self.view = Interactive3DView(self.scene, self)
         main_layout.addWidget(self.view)
-        self.draw_3d_view()
+        
+        self.draw_3d_view(fit_view=True)
 
-    def set_view_angles(self, x, y): self.angle_x, self.angle_y = x, y; self.draw_3d_view()
+    def set_view_angles(self, x, y):
+        self.angle_x, self.angle_y = x, y
+        self.zoom_scale = 1.0
+        self.draw_3d_view(fit_view=True)
+    
     def set_iso_view(self): self.set_view_angles(35.0, -45.0)
     def set_top_view(self): self.set_view_angles(0, 0)
     def set_front_view(self): self.set_view_angles(-90, 0)
@@ -355,20 +374,28 @@ class ThreeDViewDialog(QDialog):
         if path and not self.view.grab().save(path):
             QMessageBox.warning(self, "Save Error", f"Could not save image to:\n{path}")
 
-    def on_slider_change(self):
-        for name, slider in self.sliders.items():
-            self.layer_thicknesses[name] = slider.value()
-            slider.value_label.setText(f"{slider.value()}")
+    # --- CORRECTED METHOD DEFINITION ---
+    def on_slider_change(self, layer_name, new_value):
+        self.layer_thicknesses[layer_name] = new_value
+        self.sliders[layer_name].value_label.setText(f"{new_value}%")
         self.draw_3d_view()
 
     def project_point(self, x, y, z):
+        view_size = self.view.viewport().size()
+        aspect_ratio = 1.0
+        if view_size.height() > 0:
+            aspect_ratio = view_size.width() / view_size.height()
         rad_y, rad_x = math.radians(self.angle_y), math.radians(self.angle_x)
         cos_y, sin_y, cos_x, sin_x = math.cos(rad_y), math.sin(rad_y), math.cos(rad_x), math.sin(rad_x)
         x1 = x * cos_y + z * sin_y; z1 = -x * sin_y + z * cos_y
         y1 = y * cos_x - z1 * sin_x
-        return QPointF(x1 * self.zoom_scale, -y1 * self.zoom_scale)
+        return QPointF(x1 * self.zoom_scale * aspect_ratio, -y1 * self.zoom_scale)
 
-    def draw_3d_view(self):
+    def resizeEvent(self, event):
+        super().resizeEvent(event)
+        self.draw_3d_view()
+
+    def draw_3d_view(self, fit_view=False):
         self.scene.clear()
 
         def get_all_shapes_as_polygons(cell, origin=(0, 0), rotation=0, mag=1.0):
@@ -408,13 +435,27 @@ class ThreeDViewDialog(QDialog):
         min_y, max_y = min(p[1] for p in all_points_flat), max(p[1] for p in all_points_flat)
         center_x, center_y = (min_x + max_x) / 2, (min_y + max_y) / 2
 
-        grid_step = 25.0
+        design_width = max_x - min_x
+        design_height = max_y - min_y
+        
+        smallest_dim = min(design_width, design_height)
+        if smallest_dim > 0.1:
+             grid_step = smallest_dim / 50.0
+        else:
+             grid_step = 0.1
+
+        max_dimension = max(design_width, design_height)
+        if max_dimension < 1: max_dimension = 1
+        max_thickness = max_dimension * 0.20
+
         height_map, all_faces = {}, []
 
         for layer in self.project.layers:
             if not layer.visible or not Path: continue
 
-            thickness = self.layer_thicknesses.get(layer.name, 10)
+            slider_value = self.layer_thicknesses.get(layer.name, 10)
+            thickness = (slider_value / 100.0) * max_thickness
+            thickness = max(thickness, max_thickness * 0.01)
             color = QColor(*layer.color)
 
             for points_2d in all_shapes_by_layer.get(layer.name, []):
@@ -453,7 +494,7 @@ class ThreeDViewDialog(QDialog):
         total_height = max(height_map.values()) if height_map else 0
 
         if total_height > 0:
-            w, h, d = max_x - min_x, max_y - min_y, total_height
+            w, h, d = design_width, design_height, total_height
             v = [
                 (-w/2, -h/2, 0), (w/2, -h/2, 0), (w/2, h/2, 0), (-w/2, h/2, 0),
                 (-w/2, -h/2, d), (w/2, -h/2, d), (w/2, h/2, d), (-w/2, h/2, d)
@@ -466,22 +507,45 @@ class ThreeDViewDialog(QDialog):
             for face_indices in box_faces_indices:
                 all_faces.append(([v[i] for i in face_indices], box_color))
 
-        all_faces.sort(key=lambda face: sum(self.project_point(*p).y() for p in face[0])/len(face[0]))
+        # Pre-calculate rotation values for the sorting key
+        rad_y, rad_x = math.radians(self.angle_y), math.radians(self.angle_x)
+        cos_y, sin_y = math.cos(rad_y), math.sin(rad_y)
+        cos_x, sin_x = math.cos(rad_x), math.sin(rad_x)
+        
+        # Helper function to get the true Z-depth of a point after rotation
+        def get_viewspace_z(p):
+            x, y, z = p
+            z1 = -x * sin_y + z * cos_y  # Z after rotation around Y-axis
+            z_final = y * sin_x + z1 * cos_x # Z after rotation around X-axis
+            return z_final
+
+        # Sort all faces by their true average Z-depth from back to front
+        all_faces.sort(key=lambda face: sum(get_viewspace_z(p) for p in face[0]) / len(face[0]))
+        
+        # Z-centering offset
+        z_offset = -total_height / 2.0
 
         for points_3d, col in all_faces:
-            points_2d = [self.project_point(*p) for p in points_3d]
+            points_offset = [(p[0], p[1], p[2] + z_offset) for p in points_3d]
+            points_2d = [self.project_point(*p) for p in points_offset]
             pen = QPen(col.darker(110), 0)
             self.scene.addPolygon(QPolygonF(points_2d), pen, QBrush(col))
 
-        axis_length = max(max_x - min_x, max_y - min_y, total_height) * 0.75
+        axis_length = max(design_width, design_height, total_height) * 0.75
         origin_proj = self.project_point(0, 0, 0)
         axes = [((axis_length,0,0),"red","X"), ((0,axis_length,0),"green","Y"), ((0,0,axis_length),"blue","Z")]
         for axis, color_str, name in axes:
             end = self.project_point(*axis)
-            self.scene.addLine(QLineF(origin_proj, end), QPen(QColor(color_str), 2))
+            self.scene.addLine(QLineF(origin_proj, end), QPen(QColor(color_str), 0))
             label = self.scene.addText(name); label.setDefaultTextColor(QColor(color_str)); label.setPos(end)
             label.setFlag(QGraphicsItem.ItemIgnoresTransformations)
-        self.view.setSceneRect(self.scene.itemsBoundingRect().adjusted(-50, -50, 50, 50))
+        
+        if fit_view:
+            bounds = self.scene.itemsBoundingRect()
+            if bounds.isValid():
+                margin = bounds.width() * 0.05
+                self.view.fitInView(bounds.adjusted(-margin, -margin, margin, margin),
+                                    Qt.KeepAspectRatio)
 
 # -------------------------- Graphics items --------------------------
 
@@ -509,7 +573,8 @@ class RectItem(QGraphicsRectItem, SceneItemMixin):
     def refresh_appearance(self, selected=False):
         color = self.base_color.lighter(130) if selected else self.base_color
         color.setAlpha(180)
-        self.setBrush(QBrush(color)); self.setPen(QPen(Qt.black, 0.5))
+        self.setBrush(QBrush(color))
+        self.setPen(QPen(Qt.black, 0))
 
     def itemChange(self, change, value):
         if change == QGraphicsItem.ItemSelectedChange: self.refresh_appearance(selected=bool(value))
@@ -536,7 +601,8 @@ class PolyItem(QGraphicsPolygonItem, SceneItemMixin):
     def refresh_appearance(self, selected=False):
         color = self.base_color.lighter(130) if selected else self.base_color
         color.setAlpha(180)
-        self.setBrush(QBrush(color)); self.setPen(QPen(Qt.black, 0.5))
+        self.setBrush(QBrush(color))
+        self.setPen(QPen(Qt.black, 0))
 
     def itemChange(self, change, value):
         if change == QGraphicsItem.ItemSelectedChange: self.refresh_appearance(selected=bool(value))
@@ -562,7 +628,9 @@ class CircleItem(QGraphicsEllipseItem, SceneItemMixin):
 
     def refresh_appearance(self, selected=False):
         color = self.base_color.lighter(130) if selected else self.base_color
-        color.setAlpha(180); self.setBrush(QBrush(color)); self.setPen(QPen(Qt.black, 0.5))
+        color.setAlpha(180)
+        self.setBrush(QBrush(color))
+        self.setPen(QPen(Qt.black, 0))
 
     def itemChange(self, change, value):
         if change == QGraphicsItem.ItemSelectedChange: self.refresh_appearance(selected=bool(value))
@@ -704,6 +772,8 @@ class Canvas(QGraphicsView):
         super().__init__(scene)
         self.setRenderHints(QPainter.Antialiasing); self.setAcceptDrops(True)
         self.setTransformationAnchor(QGraphicsView.AnchorUnderMouse); self.setResizeAnchor(QGraphicsView.AnchorViewCenter)
+        self.setViewport(QOpenGLWidget())
+        #self.setViewportUpdateMode(QGraphicsView.FullViewportUpdate)
         self.mode = self.MODES["select"]; self.start_pos = None; self.temp_item = None
         self.temp_poly_points: List[QPointF] = []
         self.temp_path_points: List[QPointF] = []
@@ -992,12 +1062,15 @@ class MainWindow(QMainWindow):
         self.project = project
         self.active_cell_name = self.project.top
         self.active_layer_name = self.project.layers[0].name if self.project.layers else None
-        self.scene = QGraphicsScene(0, 0, self.project.canvas_width, self.project.canvas_height)
+        
+        # Use a boundless scene, this is still correct
+        self.scene = QGraphicsScene()
+
         self.view = Canvas(self.scene, self.active_layer, self)
         self.view.scale(1, -1)
         self.canvas_container = CanvasContainer(self.view, self)
         self.setCentralWidget(self.canvas_container)
-        self.update_ui_from_project()
+        self.update_ui_from_project() # This calls _redraw_scene() which populates the scene
         self._undo_stack, self._redo_stack = [], []
         self._save_state()
         self._is_dirty = False
@@ -1079,7 +1152,9 @@ class MainWindow(QMainWindow):
 
     def _load_gds_oas(self, path):
         if not gdstk: raise ImportError("GDSTK library is required for this feature.")
-        lib = gdstk.read_gds(path) if path.lower().endswith('.gds') else gdstk.read_oas(path)
+        unit_microns = 1e-6
+        lib = gdstk.read_gds(path, unit=unit_microns) if path.lower().endswith('.gds') else gdstk.read_oas(path, unit=unit_microns)
+
         sidecar_path = path + '.json'
         layer_meta = {}
         if os.path.exists(sidecar_path):
@@ -1087,27 +1162,53 @@ class MainWindow(QMainWindow):
                 with open(sidecar_path, 'r') as f:
                     layer_meta = {int(k): v for k, v in json.load(f).get('layer_metadata', {}).items()}
             except Exception as e: print(f"Warning: Could not read sidecar metadata file. {e}")
+        
         project = self._create_default_project(50, 2000, 1500)
-        project.layers.clear(); project.cells.clear()
-        gds_layers = sorted(list(lib.layers))
+        project.cells.clear()
+
+        gds_layers = sorted({ld[0] for ld in lib.layers_and_datatypes()})
+        layer_num_to_name = {}
+        existing_layer_names = {l.name for l in project.layers}
+
         for l_num in gds_layers:
+            layer_name = None
             if l_num in layer_meta:
                 meta = layer_meta[l_num]
-                project.layers.append(Layer(name=meta['name'], color=tuple(meta['color']), visible=meta['visible']))
+                layer_name = meta['name']
+                if layer_name not in existing_layer_names:
+                    project.layers.append(Layer(name=layer_name, color=tuple(meta['color']), visible=meta['visible']))
+                    existing_layer_names.add(layer_name)
             else:
-                project.layers.append(Layer(f"Layer_{l_num}", (l_num*20%255, l_num*50%255, l_num*80%255)))
+                layer_name = f"Layer_{l_num}"
+                if layer_name not in existing_layer_names:
+                    project.layers.append(Layer(layer_name, (l_num*20%255, l_num*50%255, l_num*80%255)))
+                    existing_layer_names.add(layer_name)
+            layer_num_to_name[l_num] = layer_name
+
         project.refresh_layer_map()
-        layer_num_to_name = {l_num: next(l.name for l in project.layers if l.name.endswith(f"_{l_num}")) for l_num in gds_layers}
+        
         for cell in lib.cells:
             new_cell = Cell()
+            # NO MORE MANUAL SCALING NEEDED HERE
             for poly in cell.polygons:
-                new_cell.polygons.append(Poly(layer_num_to_name.get(poly.layer, f"Layer_{poly.layer}"), poly.points.tolist()))
+                layer_name = layer_num_to_name.get(poly.layer, f"Layer_{poly.layer}")
+                new_cell.polygons.append(Poly(layer_name, poly.points.tolist()))
+
             for ref in cell.references:
                 ref_cell_name = ref.cell.name if isinstance(ref.cell, gdstk.Cell) else ref.cell
                 new_cell.references.append(Ref(ref_cell_name, ref.origin, ref.rotation, ref.magnification))
             project.cells[cell.name] = new_cell
-        if lib.top_level(): project.top = lib.top_level()[0].name
-        elif project.cells: project.top = list(project.cells.keys())[0]
+            
+        # Robustly find and set the top cell
+        if lib.top_level(): 
+            project.top = lib.top_level()[0].name
+        elif project.cells: 
+            project.top = list(project.cells.keys())[0]
+        else:
+             # If there are no cells at all, create an empty TOP cell to prevent crashes
+            project.top = "TOP"
+            project.cells["TOP"] = Cell()
+
         self.current_file_path = None
         self.initialize_project(project)
 
@@ -1142,7 +1243,9 @@ class MainWindow(QMainWindow):
         if not path: return
         QApplication.setOverrideCursor(Qt.WaitCursor)
         try:
-            lib = gdstk.Library(unit=float(self.project.units.replace('um','e-6')))
+            units_in_meters = {'um': 1e-6, 'nm': 1e-9, 'mm': 1e-3}
+            unit_value = units_in_meters.get(self.project.units.lower(), 1e-6) # Defaults to um
+            lib = gdstk.Library(unit=unit_value)            
             layer_map = {layer.name: i for i, layer in enumerate(self.project.layers, 1)}
             gds_cells = {name: lib.new_cell(name) for name in self.project.cells}
             for name, cell in self.project.cells.items():
@@ -1486,12 +1589,14 @@ class MainWindow(QMainWindow):
             QMessageBox.warning(self, "Feature Disabled", "The Path/Wire tool requires the 'gdstk' library to be installed.")
             return
 
-        width, ok = QInputDialog.getDouble(self, "Path Width", "Enter path width:", 10.0, 0.01, 10000.0, 2)
+        sensible_width = self.get_sensible_default_value(divisor=100.0)
+
+        width, ok = QInputDialog.getDouble(self, "Path Width", "Enter path width:", sensible_width, 0.001, 10000.0, 3)
+        
         if not ok: return
         
         try:
             point_list = [(p.x(), p.y()) for p in points]
-            # Use gdstk to convert the centerline and width into a polygon
             path = gdstk.FlexPath(point_list, width)
             new_polygons = path.to_polygons() # This can return multiple polygons
             
@@ -1614,7 +1719,11 @@ class MainWindow(QMainWindow):
         if not gdstk: QMessageBox.warning(self, "Feature Disabled", "Please install 'gdstk'."); return
         selected = [it for it in self.scene.selectedItems() if isinstance(it, PolyItem)]
         if not selected: self.statusBar().showMessage("Select one or more polygons to fillet."); return
-        dlg = FilletDialog(self)
+
+        sensible_radius = self.get_sensible_default_value(divisor=50.0) # A fillet is usually larger
+        
+        dlg = FilletDialog(self, default_radius=sensible_radius)
+        
         if dlg.exec_() == QDialog.Accepted:
             radius = dlg.get_radius()
             for item in selected:
@@ -1792,6 +1901,29 @@ class MainWindow(QMainWindow):
             QLabel, QCheckBox { color: palette(text); font-size: 8pt; }
             QFrame[frameShape="5"] { color: palette(midlight); }
         """)
+
+    def get_sensible_default_value(self, divisor=100.0):
+        """
+        Calculates a reasonable default value (e.g., for widths, radii)
+        based on the scale of the currently visible scene.
+        """
+        if not hasattr(self, 'view'):
+            return 1.0
+
+        try:
+            visible_rect = self.view.mapToScene(self.view.viewport().rect()).boundingRect()
+
+            if visible_rect.isEmpty() or visible_rect.width() <= 0:
+                return 1.0
+
+            default_value = visible_rect.width() / divisor
+            
+            if default_value < 0.01: return 0.01
+            if default_value > 1000: return 1000
+
+            return round(default_value, 3)
+        except Exception:
+            return 1.0
 
     def rename_selected_shape(self):
         if not self.project: return
