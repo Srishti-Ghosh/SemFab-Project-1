@@ -70,6 +70,7 @@ class Cell:
     polygons: List[Poly] = field(default_factory=list)
     ellipses: List[Ellipse] = field(default_factory=list)
     references: List[Ref] = field(default_factory=list)
+    etch_pairs: List[Tuple[str, str, float]] = field(default_factory=list)
 
 @dataclass
 class Project:
@@ -405,6 +406,7 @@ class ThreeDViewDialog(QDialog):
         self.scene.clear()
 
         def get_all_shapes_as_polygons(cell, origin=(0, 0), rotation=0, mag=1.0):
+            # This helper function is unchanged
             shapes = []
             t = QTransform().translate(origin[0], origin[1]).rotate(rotation).scale(mag, mag)
             for p_data in cell.polygons:
@@ -415,136 +417,156 @@ class ThreeDViewDialog(QDialog):
                 if (layer := self.project.layer_by_name.get(e_data.layer)) and layer.visible:
                     rect = QRectF(*e_data.rect)
                     poly = QPolygonF([QPointF(rect.center().x() + rect.width()/2 * math.cos(i/16*math.pi),
-                                              rect.center().y() + rect.height()/2 * math.sin(i/16*math.pi)) for i in range(32)])
+                                            rect.center().y() + rect.height()/2 * math.sin(i/16*math.pi)) for i in range(32)])
                     shapes.append((e_data.layer, [(p.x(), p.y()) for p in t.map(poly)]))
             for ref in cell.references:
                 if ref.cell in self.project.cells:
                     ref_origin_transformed = t.map(QPointF(*ref.origin))
                     shapes.extend(get_all_shapes_as_polygons(self.project.cells[ref.cell],
-                                                             (ref_origin_transformed.x(), ref_origin_transformed.y()),
-                                                             ref.rotation + rotation,
-                                                             ref.magnification * mag))
+                                                        (ref_origin_transformed.x(), ref_origin_transformed.y()),
+                                                        ref.rotation + rotation,
+                                                        ref.magnification * mag))
             return shapes
 
-        for layer in self.project.layers:
-            if not layer.visible or not Path: continue
-            thickness = getattr(layer, 'thickness_3d', self.layer_thicknesses.get(layer.name, 10))
-        all_shapes_by_layer = {layer.name: [] for layer in self.project.layers}
+        # === PASS 1: Calculate all final 2D geometric primitives ===
         all_shapes = get_all_shapes_as_polygons(self.project.cells[self.project.top])
         if not all_shapes: return
 
-        for layer_name, points in all_shapes:
-            if layer_name in all_shapes_by_layer:
-                all_shapes_by_layer[layer_name].append(points)
+        active_cell_3d = self.project.cells[self.project.top]
+        geometric_primitives = []
+        if gdstk and hasattr(active_cell_3d, 'etch_pairs') and active_cell_3d.etch_pairs:
+            etch_masks = {}
+            used_mask_layers = set()
+            for mask, sub, depth in active_cell_3d.etch_pairs:
+                used_mask_layers.add(mask)
+                if sub not in etch_masks: etch_masks[sub] = []
+                etch_masks[sub].extend([(gdstk.Polygon(p), depth) for L, p in all_shapes if L == mask])
+            
+            for layer_name, points in all_shapes:
+                if layer_name in used_mask_layers: continue
+                
+                if layer_name in etch_masks and etch_masks[layer_name]:
+                    substrate_poly = gdstk.Polygon(points)
+                    masks_for_sub = [m[0] for m in etch_masks[layer_name]]
+                    depth = etch_masks[layer_name][0][1]
 
-        all_points_flat = [pt for _, poly_pts in all_shapes for pt in poly_pts]
-        if not all_points_flat: return
+                    un_etched = gdstk.boolean(substrate_poly, masks_for_sub, 'not')
+                    cavity_floors = gdstk.boolean(substrate_poly, masks_for_sub, 'and')
 
+                    for part in un_etched: geometric_primitives.append({'layer': layer_name, 'points': part.points.tolist(), 'mod': 0})
+                    for floor in cavity_floors: geometric_primitives.append({'layer': layer_name, 'points': floor.points.tolist(), 'mod': -depth})
+                else:
+                    geometric_primitives.append({'layer': layer_name, 'points': points, 'mod': 0})
+        else:
+            geometric_primitives = [{'layer': l, 'points': p, 'mod': 0} for l, p in all_shapes]
+
+        if not geometric_primitives: return
+        
+        # === PASS 2: Build the complete, final height map from the primitives ===
+        height_map = {}
+        grid_step = 20.0
+        layer_order = {layer.name: i for i, layer in enumerate(self.project.layers)}
+        geometric_primitives.sort(key=lambda s: layer_order.get(s['layer'], -1))
+
+        for shape in geometric_primitives:
+            layer_name, points_2d, thickness_mod = shape['layer'], shape['points'], shape['mod']
+            layer = self.project.layer_by_name.get(layer_name)
+            if not layer or not Path or not points_2d: continue
+            
+            full_thickness = self.layer_thicknesses.get(layer_name, 10)
+            thickness = max(0, full_thickness + thickness_mod)
+            path = Path(points_2d)
+
+            p_min_x_g = int(min(p[0] for p in points_2d) // grid_step)
+            p_max_x_g = int(max(p[0] for p in points_2d) // grid_step)
+            p_min_y_g = int(min(p[1] for p in points_2d) // grid_step)
+            p_max_y_g = int(max(p[1] for p in points_2d) // grid_step)
+            
+            for gx in range(p_min_x_g, p_max_x_g + 1):
+                for gy in range(p_min_y_g, p_max_y_g + 1):
+                    if path.contains_point(((gx + 0.5) * grid_step, (gy + 0.5) * grid_step)):
+                        base_z = height_map.get((gx, gy), 0)
+                        height_map[(gx, gy)] = base_z + thickness
+
+        # === PASS 3: Render all faces using the final height map ===
+        all_faces = []
+        all_points_flat = [pt for shape in geometric_primitives for pt in shape['points']]
         min_x, max_x = min(p[0] for p in all_points_flat), max(p[0] for p in all_points_flat)
         min_y, max_y = min(p[1] for p in all_points_flat), max(p[1] for p in all_points_flat)
         center_x, center_y = (min_x + max_x) / 2, (min_y + max_y) / 2
 
-        design_width = max_x - min_x
-        design_height = max_y - min_y
-        
-        smallest_dim = min(design_width, design_height)
-        if smallest_dim > 0.1:
-             grid_step = smallest_dim / 50.0
-        else:
-             grid_step = 0.1
+        # Re-build the height map from scratch for this pass to get base_z values
+        render_height_map = {} 
+        for shape in geometric_primitives:
+            layer_name, points_2d, thickness_mod = shape['layer'], shape['points'], shape['mod']
+            layer = self.project.layer_by_name.get(layer_name)
+            if not layer or not layer.visible or not Path or not points_2d: continue
 
-        max_dimension = max(design_width, design_height)
-        if max_dimension < 1: max_dimension = 1
-        max_thickness = max_dimension * 0.20
-
-        height_map, all_faces = {}, []
-
-        for layer in self.project.layers:
-            if not layer.visible or not Path: continue
-
-            slider_value = self.layer_thicknesses.get(layer.name, 10)
-            thickness = (slider_value / 100.0) * max_thickness
-            thickness = max(thickness, max_thickness * 0.01)
+            full_thickness = self.layer_thicknesses.get(layer_name, 10)
+            thickness = max(0, full_thickness + thickness_mod)
             color = QColor(*layer.color)
 
-            for points_2d in all_shapes_by_layer.get(layer.name, []):
-                path = Path(points_2d)
+            base_z = 0
+            path = Path(points_2d)
+            p_min_x_g = int(min(p[0] for p in points_2d) // grid_step)
+            p_max_x_g = int(max(p[0] for p in points_2d) // grid_step)
+            p_min_y_g = int(min(p[1] for p in points_2d) // grid_step)
+            p_max_y_g = int(max(p[1] for p in points_2d) // grid_step)
 
-                p_min_x_g = int(min(p[0] for p in points_2d) // grid_step)
-                p_max_x_g = int(max(p[0] for p in points_2d) // grid_step)
-                p_min_y_g = int(min(p[1] for p in points_2d) // grid_step)
-                p_max_y_g = int(max(p[1] for p in points_2d) // grid_step)
+            # Find the single base_z for this primitive
+            footprint_z_values = [0]
+            for gx in range(p_min_x_g, p_max_x_g + 1):
+                for gy in range(p_min_y_g, p_max_y_g + 1):
+                    if path.contains_point(((gx + 0.5) * grid_step, (gy + 0.5) * grid_step)):
+                        footprint_z_values.append(render_height_map.get((gx, gy), 0))
+            base_z = max(footprint_z_values)
 
-                footprint_z_values = [0]
-                for gx in range(p_min_x_g, p_max_x_g + 1):
-                    for gy in range(p_min_y_g, p_max_y_g + 1):
-                        if path.contains_point(((gx + 0.5) * grid_step, (gy + 0.5) * grid_step)):
-                            footprint_z_values.append(height_map.get((gx, gy), 0))
+            # Create faces
+            centered_pts = [(p[0] - center_x, p[1] - center_y) for p in points_2d]
+            floor_pts = [(*p, base_z) for p in centered_pts]
+            ceiling_pts = [(*p, base_z + thickness) for p in centered_pts]
+            all_faces.append((ceiling_pts, color.lighter(110)))
+            if base_z > 0: all_faces.append((floor_pts, color.darker(120)))
+            for i in range(len(floor_pts)):
+                p1, p2 = floor_pts[i], floor_pts[(i + 1) % len(floor_pts)]
+                p3, p4 = ceiling_pts[(i + 1) % len(floor_pts)], ceiling_pts[i]
+                all_faces.append(([p1, p2, p3, p4], color))
 
-                base_z = max(footprint_z_values)
+            # Update the render_height_map for the next shape in this pass
+            new_top_z = base_z + thickness
+            for gx in range(p_min_x_g, p_max_x_g + 1):
+                for gy in range(p_min_y_g, p_max_y_g + 1):
+                    if path.contains_point(((gx + 0.5) * grid_step, (gy + 0.5) * grid_step)):
+                        render_height_map[(gx, gy)] = new_top_z
 
-                centered_pts = [(p[0] - center_x, p[1] - center_y) for p in points_2d]
-                floor_pts = [(*p, base_z) for p in centered_pts]
-                ceiling_pts = [(*p, base_z + thickness) for p in centered_pts]
-                all_faces.append((ceiling_pts, color.lighter(110)))
-                all_faces.append((floor_pts, color.darker(120)))
+        # Add translucent bounding box using the final height map
+        design_width = max_x - min_x
+        design_height = max_y - min_y
+        total_h = max(height_map.values()) if height_map else 0
+        if total_h > 0:
+            v = [(-design_width/2,-design_height/2,0), (design_width/2,-design_height/2,0), (design_width/2,design_height/2,0), (-design_width/2,design_height/2,0),
+                (-design_width/2,-design_height/2,total_h), (design_width/2,-design_height/2,total_h), (design_width/2,design_height/2,total_h), (-design_width/2,design_height/2,total_h)]
+            box_faces = [(0,1,2,3), (4,5,6,7), (0,3,7,4), (1,2,6,5), (0,1,5,4), (2,3,7,6)]
+            for face in box_faces: all_faces.append(([v[i] for i in face], QColor(150,150,150,40)))
 
-                for i in range(len(floor_pts)):
-                    p1, p2 = floor_pts[i], floor_pts[(i + 1) % len(floor_pts)]
-                    p3, p4 = ceiling_pts[(i + 1) % len(floor_pts)], ceiling_pts[i]
-                    all_faces.append(([p1, p2, p3, p4], color))
-
-                new_top_z = base_z + thickness
-                for gx in range(p_min_x_g, p_max_x_g + 1):
-                    for gy in range(p_min_y_g, p_max_y_g + 1):
-                        if path.contains_point(((gx + 0.5) * grid_step, (gy + 0.5) * grid_step)):
-                            height_map[(gx, gy)] = new_top_z
-
-        total_height = max(height_map.values()) if height_map else 0
-
-        if total_height > 0:
-            w, h, d = design_width, design_height, total_height
-            v = [
-                (-w/2, -h/2, 0), (w/2, -h/2, 0), (w/2, h/2, 0), (-w/2, h/2, 0),
-                (-w/2, -h/2, d), (w/2, -h/2, d), (w/2, h/2, d), (-w/2, h/2, d)
-            ]
-            box_faces_indices = [
-                (0, 1, 2, 3), (4, 5, 6, 7), (0, 3, 7, 4),
-                (1, 2, 6, 5), (0, 1, 5, 4), (2, 3, 7, 6)
-            ]
-            box_color = QColor(150, 150, 150, 40)
-            for face_indices in box_faces_indices:
-                all_faces.append(([v[i] for i in face_indices], box_color))
-
-        # Pre-calculate rotation values for the sorting key
+        # Final sorting and drawing
         rad_y, rad_x = math.radians(self.angle_y), math.radians(self.angle_x)
-        cos_y, sin_y = math.cos(rad_y), math.sin(rad_y)
-        cos_x, sin_x = math.cos(rad_x), math.sin(rad_x)
-        
-        # Helper function to get the true Z-depth of a point after rotation
+        cos_y, sin_y, cos_x, sin_x = math.cos(rad_y), math.sin(rad_y), math.cos(rad_x), math.sin(rad_x)
         def get_viewspace_z(p):
-            x, y, z = p
-            z1 = -x * sin_y + z * cos_y  # Z after rotation around Y-axis
-            z_final = y * sin_x + z1 * cos_x # Z after rotation around X-axis
-            return z_final
-
-        # Sort all faces by their true average Z-depth from back to front
+            x, y, z = p; z1 = -x * sin_y + z * cos_y; return y * sin_x + z1 * cos_x
         all_faces.sort(key=lambda face: sum(get_viewspace_z(p) for p in face[0]) / len(face[0]))
-        
-        # Z-centering offset
-        z_offset = -total_height / 2.0
 
+        z_offset = -total_h / 2.0
         for points_3d, col in all_faces:
             points_offset = [(p[0], p[1], p[2] + z_offset) for p in points_3d]
             points_2d = [self.project_point(*p) for p in points_offset]
-            pen = QPen(col.darker(110), 0)
-            self.scene.addPolygon(QPolygonF(points_2d), pen, QBrush(col))
+            self.scene.addPolygon(QPolygonF(points_2d), QPen(col.darker(110), 0), QBrush(col))
 
-        axis_length = max(design_width, design_height, total_height) * 0.75
-        origin_proj = self.project_point(0, 0, 0)
+        axis_length = max(design_width, design_height, total_h) * 0.75
+        origin_proj = self.project_point(0, 0, z_offset)
         axes = [((axis_length,0,0),"red","X"), ((0,axis_length,0),"green","Y"), ((0,0,axis_length),"blue","Z")]
         for axis, color_str, name in axes:
-            end = self.project_point(*axis)
+            end = self.project_point(axis[0], axis[1], axis[2] + z_offset)
             self.scene.addLine(QLineF(origin_proj, end), QPen(QColor(color_str), 0))
             label = self.scene.addText(name); label.setDefaultTextColor(QColor(color_str)); label.setPos(end)
             label.setFlag(QGraphicsItem.ItemIgnoresTransformations)
@@ -553,8 +575,7 @@ class ThreeDViewDialog(QDialog):
             bounds = self.scene.itemsBoundingRect()
             if bounds.isValid():
                 margin = bounds.width() * 0.05
-                self.view.fitInView(bounds.adjusted(-margin, -margin, margin, margin),
-                                    Qt.KeepAspectRatio)
+                self.view.fitInView(bounds.adjusted(-margin, -margin, margin, margin), Qt.KeepAspectRatio)
 
 # -------------------------- Graphics items --------------------------
 
@@ -627,31 +648,67 @@ class ProcessDialog(QDialog):
         super().__init__(parent)
         self.setWindowTitle("Simulate Process Step")
         self.project = project
-        layout = QVBoxLayout(self)
+        layout = QGridLayout(self)
 
+        layout.addWidget(QLabel("Process Step:"), 0, 0)
         self.step_combo = QComboBox()
         self.step_combo.addItems(["Deposition", "Etching", "Doping"])
-        layout.addWidget(QLabel("Process Step:"))
-        layout.addWidget(self.step_combo)
+        layout.addWidget(self.step_combo, 0, 1)
 
+        self.mask_layer_label = QLabel("Mask/Target Layer:")
+        layout.addWidget(self.mask_layer_label, 1, 0)
         self.layer_combo = QComboBox()
         self.layer_combo.addItems([l.name for l in self.project.layers])
-        layout.addWidget(QLabel("Target Layer:"))
-        layout.addWidget(self.layer_combo)
+        layout.addWidget(self.layer_combo, 1, 1)
 
+        # Add widgets for the substrate layer, initially hidden
+        self.substrate_label = QLabel("Substrate Layer (to Etch):")
+        layout.addWidget(self.substrate_label, 2, 0)
+        self.substrate_combo = QComboBox()
+        self.substrate_combo.addItems([l.name for l in self.project.layers])
+        layout.addWidget(self.substrate_combo, 2, 1)
+        self.substrate_label.hide()
+        self.substrate_combo.hide()
+
+        layout.addWidget(QLabel("Parameter (thickness, etc.):"), 3, 0)
         self.param_spin = QDoubleSpinBox()
         self.param_spin.setRange(-1000, 1000)
         self.param_spin.setValue(10.0)
-        layout.addWidget(QLabel("Parameter (thickness or rate):"))
-        layout.addWidget(self.param_spin)
-        
+        layout.addWidget(self.param_spin, 3, 1)
+
         buttons = QDialogButtonBox(QDialogButtonBox.Ok | QDialogButtonBox.Cancel)
         buttons.accepted.connect(self.accept)
         buttons.rejected.connect(self.reject)
-        layout.addWidget(buttons)
+        layout.addWidget(buttons, 4, 0, 1, 2)
+        
+        # Connect signal to show/hide substrate widgets
+        self.step_combo.currentTextChanged.connect(self.on_step_changed)
+        self.on_step_changed(self.step_combo.currentText()) # Initial setup
+
+    def on_step_changed(self, step):
+        is_etching = (step == "Etching")
+        self.substrate_label.setVisible(is_etching)
+        self.substrate_combo.setVisible(is_etching)
+        if is_etching:
+            self.mask_layer_label.setText("Mask Layer:")
+        else:
+            self.mask_layer_label.setText("Target Layer:")
 
     def get_values(self):
-        return self.step_combo.currentText(), self.layer_combo.currentText(), self.param_spin.value()
+        step = self.step_combo.currentText()
+        if step == "Etching":
+            return {
+                "step": step,
+                "mask_layer": self.layer_combo.currentText(),
+                "substrate_layer": self.substrate_combo.currentText(),
+                "parameter": self.param_spin.value()
+            }
+        else:
+            return {
+                "step": step,
+                "layer": self.layer_combo.currentText(),
+                "parameter": self.param_spin.value()
+            }
 
 class CircleItem(QGraphicsEllipseItem, SceneItemMixin):
     def __init__(self, rect, layer, data_obj, selectable=True):
@@ -1305,66 +1362,38 @@ class MainWindow(QMainWindow):
         finally: QApplication.restoreOverrideCursor()
 
     def run_process_step(self):
+        """Opens the process simulation dialog and applies the selected fabrication step."""
         if not self.project:
-            QMessageBox.warning(self, "No Project", "Please create or open a project first.")
+            QMessageBox.warning(self, "No Project", "Please open a project first.")
             return
 
         dlg = ProcessDialog(self.project, self)
         if dlg.exec_() != QDialog.Accepted:
             return
 
-        # values is a tuple: (step, layer_name, parameter)
         values = dlg.get_values()
-        try:
-            step, layer_name, parameter = values
-        except (TypeError, ValueError):
-            # fallback if get_values() is changed to return dict later
-            step = values.get('step')
-            layer_name = values.get('layer')
-            parameter = values.get('parameter')
+        step = values["step"]
+        parameter = values["parameter"]
 
-        # Defaults for fields not provided by the dialog
-        region = "Selected shapes only" if self.scene.selectedItems() else "All shapes on layer"
-        visual_effect = True
-
-
-        # Get the target layer
-        target_layer = self.project.layer_by_name.get(layer_name)
-        if not target_layer:
-            QMessageBox.warning(self, "Layer Not Found", f"Layer '{layer_name}' not found.")
-            return
-
-        active_cell = self.project.cells.get(self.active_cell_name)
-        if not active_cell:
-            return
-
-        # Determine which shapes to process
-        if region == "Selected shapes only" and self.scene.selectedItems():
-            shapes_to_process = [item.data_obj for item in self.scene.selectedItems() 
-                            if hasattr(item, 'data_obj') and item.data_obj.layer == layer_name]
-        else:
-            # Process all shapes on the target layer
-            shapes_to_process = [p for p in active_cell.polygons if p.layer == layer_name]
-            shapes_to_process.extend([e for e in active_cell.ellipses if e.layer == layer_name])
-
-        if not shapes_to_process:
-            QMessageBox.information(self, "No Shapes", 
-                                f"No shapes found on layer '{layer_name}' to process.")
-            return
-
-        # Apply the fabrication step
         if step == "Deposition":
-            self._apply_deposition(layer_name, parameter, visual_effect)
-        elif step == "Etching":
-            self._apply_etching(shapes_to_process, layer_name, parameter, visual_effect)
+            self._apply_deposition(values["layer"], parameter, True)
         elif step == "Doping":
-            self._apply_doping(shapes_to_process, layer_name, parameter, visual_effect)
+            active_cell = self.project.cells.get(self.active_cell_name)
+            shapes_to_process = []
+            if self.scene.selectedItems():
+                shapes_to_process = [item.data_obj for item in self.scene.selectedItems()
+                                if hasattr(item, 'data_obj') and item.data_obj.layer == values["layer"]]
+            else:
+                shapes_to_process = [p for p in active_cell.polygons if p.layer == values["layer"]]
+                shapes_to_process.extend([e for e in active_cell.ellipses if e.layer == values["layer"]])
+            self._apply_doping(shapes_to_process, values["layer"], parameter, True)
+        # Inside run_process_step...
+        elif step == "Etching":
+            self._apply_etching(values["mask_layer"], values["substrate_layer"], parameter)
 
         self._save_state()
         self._redraw_scene()
-
-        self.statusBar().showMessage(
-            f"Applied {step} to layer '{layer_name}' with parameter {parameter:.2f}")
+        self.statusBar().showMessage(f"Applied {step} successfully.")
 
 
     def _apply_deposition(self, layer_name, thickness, visual_effect):
@@ -1397,73 +1426,63 @@ class MainWindow(QMainWindow):
         QMessageBox.information(self, "Deposition Complete",
             f"Added {thickness:.0f} nm uniform layer on '{layer_name}'.\n"
             f"This affects 3D visualization thickness.")
+        
+    def _apply_etching(self, mask_layer_name, substrate_layer_name, etch_depth):
+        """Simulates an etch by darkening the mask and recording an etch instruction with depth."""
+        if mask_layer_name == substrate_layer_name:
+            QMessageBox.warning(self, "Logic Error", "Mask and Substrate layer cannot be the same.")
+            return
 
+        active_cell = self.project.cells.get(self.active_cell_name)
+        mask_layer = self.project.layer_by_name.get(mask_layer_name)
+        if not active_cell or not mask_layer:
+            return
 
-    def _apply_etching(self, shapes_to_process, layer_name, etch_depth, visual_effect):
-        """Simulates etching by reducing or removing selected regions."""
-        target_layer = self.project.layer_by_name.get(layer_name)
+        # 1. Darken the mask layer for a simple 2D visual cue
+        r, g, b = mask_layer.color
+        mask_layer.color = (max(0, r - 40), max(0, g - 40), max(0, b - 40))
 
-        # Store process history
-        if not hasattr(target_layer, 'process_history'):
-            target_layer.process_history = []
+        # 2. Record the etch instruction with depth in the cell's data
+        etch_instruction = (mask_layer_name, substrate_layer_name, etch_depth)
+        # Avoid duplicate instructions
+        if not any(e[0] == mask_layer_name and e[1] == substrate_layer_name for e in active_cell.etch_pairs):
+            active_cell.etch_pairs.append(etch_instruction)
 
-        target_layer.process_history.append({
-            'step': 'Etching',
-            'depth': etch_depth,
-            'shapes_affected': len(shapes_to_process)
-        })
-
-        current = getattr(target_layer, 'thickness_3d', 10)
-        target_layer.thickness_3d = max(0, current - etch_depth)
-
-        if visual_effect:
-            # Darken the layer to indicate etching
-            r, g, b = target_layer.color
-            target_layer.color = (
-                max(0, int(r * 0.8)),
-                max(0, int(g * 0.8)),
-                max(0, int(b * 0.8))
-            )
-
-        QMessageBox.information(self, "Etching Complete",
-            f"Etched {etch_depth:.0f} nm from {len(shapes_to_process)} shape(s) on '{layer_name}'.\n"
-            f"Layer color updated to reflect etching.")
-
-
+        # 3. Redraw the 2D scene and inform the user
+        self._redraw_scene()
+        QMessageBox.information(self, "Etch Step Recorded",
+            f"Mask '{mask_layer_name}' will now etch '{substrate_layer_name}' by a depth of {etch_depth} units in the 3D view.")
+        
     def _apply_doping(self, shapes_to_process, layer_name, dose, visual_effect):
-        """Simulates doping by changing color/annotation of shapes."""
-        target_layer = self.project.layer_by_name.get(layer_name)
+        """Simulates doping by moving shapes to a new 'doped' layer and annotating them."""
+        if not shapes_to_process:
+            return
 
-        # Store process history
-        if not hasattr(target_layer, 'process_history'):
-            target_layer.process_history = []
+        # Define the new doped layer
+        original_layer = self.project.layer_by_name.get(layer_name)
+        doped_layer_name = f"{layer_name}_doped"
+        doped_layer = self.project.layer_by_name.get(doped_layer_name)
 
-        target_layer.process_history.append({
-            'step': 'Doping',
-            'dose': dose,
-            'shapes_affected': len(shapes_to_process)
-        })
+        # Create the doped layer if it doesn't exist
+        if not doped_layer:
+            r, g, b = original_layer.color
+            # Create a visually distinct color for the doped version
+            new_color = (min(255, r + 50), max(0, g - 50), min(255, b + 50))
+            doped_layer = Layer(name=doped_layer_name, color=new_color)
+            self.project.layers.append(doped_layer)
+            self.project.refresh_layer_map()
+            self._refresh_layer_list() # Update the layer list widget
 
-        if visual_effect:
-            # Change layer color to indicate doping (add red/orange tint)
-            r, g, b = target_layer.color
-            target_layer.color = (
-                min(255, r + 30),
-                max(0, g - 10),
-                max(0, b - 10)
-            )
-
-        # Annotate shapes with doping information
+        # Move shapes to the new layer and annotate their names
         for shape in shapes_to_process:
+            shape.layer = doped_layer_name
             if hasattr(shape, 'name'):
-                if shape.name:
-                    shape.name = f"{shape.name} (Doped: {dose:.1f}×10¹⁵)"
-                else:
-                    shape.name = f"Doped: {dose:.1f}×10¹⁵ cm⁻²"
-
+                current_name = shape.name or ""
+                shape.name = f"{current_name} (Dose: {dose:.1E})".strip()
+        
         QMessageBox.information(self, "Doping Complete",
-            f"Applied doping dose {dose:.1f}×10¹⁵ cm⁻² to {len(shapes_to_process)} shape(s) on '{layer_name}'.\n"
-            f"Shapes annotated with doping information.")
+            f"Applied doping to {len(shapes_to_process)} shape(s).\n"
+            f"Shapes moved to new layer: '{doped_layer_name}'.")
 
     # --- UI Building & Core Logic ---
 
@@ -1948,15 +1967,40 @@ class MainWindow(QMainWindow):
         if self.project: ThreeDViewDialog(self.project, self).exec_()
 
     def export_svg(self):
-        if not self.project: return
+        if not self.project:
+            return
         path, _ = QFileDialog.getSaveFileName(self, "Export SVG", "", "SVG Files (*.svg)")
-        if not path: return
-        gen = QSvgGenerator(); gen.setFileName(path)
-        rect = self.scene.itemsBoundingRect().adjusted(-50, -50, 50, 50)
-        gen.setViewBox(rect)
+        if not path:
+            return
+
+        # 1. Get the exact bounding rectangle of all items
+        items_rect = self.scene.itemsBoundingRect()
+        
+        if not items_rect.isValid() or items_rect.isEmpty():
+            QMessageBox.warning(self, "Export Error", "The current cell is empty. Nothing to export.")
+            return
+
+        # 2. Add a small margin for clarity
+        margin = max(items_rect.width(), items_rect.height()) * 0.05
+        if margin == 0: margin = 10 # Add a default margin for very small designs
+        export_rect = items_rect.adjusted(-margin, -margin, margin, margin)
+
+        # 3. Set up the SVG generator
+        gen = QSvgGenerator()
+        gen.setFileName(path)
+        gen.setSize(export_rect.size().toSize())
+        gen.setViewBox(export_rect)
+
+        # 4. Render the scene
         painter = QPainter(gen)
-        self.scene.render(painter, target=QRectF(), source=rect)
+        
+        # CRITICAL FIX: Explicitly tell render() which SOURCE rectangle from the scene to draw.
+        # Because the viewBox is already set, we don't need a target rectangle.
+        self.scene.render(painter, source=export_rect)
+        
         painter.end()
+        
+        self.statusBar().showMessage(f"Successfully exported SVG to {path}")
 
     def set_grid_pitch(self, value):
         if self.project: self.project.grid_pitch = value; self.view.viewport().update(); self._mark_dirty()
