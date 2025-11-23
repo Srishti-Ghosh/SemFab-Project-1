@@ -782,12 +782,12 @@ class ProcessDialog(QDialog):
         self.lbl_param1.setVisible(True); self.spin_param1.setVisible(True)
 
         if step_name == "Deposition":
-            self.combo_type.addItems(["PVD", "CVD", "Spin-on", "Electroplating"])
+            self.combo_type.addItems(["Stacked", "Conformal"])
             self.lbl_layer1.setText("Target Layer:")
             self.lbl_param1.setText("Thickness:")
 
         elif step_name == "Etch":
-            self.combo_type.addItems(["Wet Etch", "RIE (Dry)", "DRIE", "Ion Milling"])
+            self.combo_type.addItems(["Wet Etch", "Dry Etch"])
             self.lbl_layer1.setText("Mask Layer:")
             self.lbl_layer2.setVisible(True); self.lbl_layer2.setText("Substrate (to be etched):")
             self.combo_layer2.setVisible(True)
@@ -1295,13 +1295,12 @@ from PyQt5.QtCore import QThread, pyqtSignal
 # --- 1. The Worker Thread (Does the math in background) ---
 class SimulationWorker(QThread):
     progress_update = pyqtSignal(int, str)
-    finished_data = pyqtSignal(object, float, tuple) # Added tuple for (min_x, min_y) offset
+    finished_data = pyqtSignal(object, float, tuple)
     error_occurred = pyqtSignal(str)
 
     def __init__(self, project, width, height):
         super().__init__()
         self.project = project
-        # We ignore width/height inputs now and calculate them dynamically
 
     def run(self):
         try:
@@ -1309,146 +1308,173 @@ class SimulationWorker(QThread):
             from scipy.ndimage import distance_transform_edt, gaussian_filter
             import matplotlib.path as mpath
 
-            self.progress_update.emit(5, "Analyzing Layout...")
+            self.progress_update.emit(5, "Analyzing Design Extents...")
 
-            # --- 1. Dynamic Bounding Box Calculation ---
-            # Collect all points from all visible polygons to find the active area
-            all_xs = []
-            all_ys = []
+            # --- 1. Dynamic Bounding Box (Cropping) ---
             cell = self.project.cells[self.project.top]
+            all_xs, all_ys = [], []
             
-            visible_layers = [l for l in self.project.layers if l.visible]
-            visible_names = {l.name for l in visible_layers}
-
-            has_content = False
+            # Gather all points to find where the chip actually is
             for p in cell.polygons:
-                if p.layer in visible_names and p.points:
-                    xs = [pt[0] for pt in p.points]
-                    ys = [pt[1] for pt in p.points]
-                    all_xs.extend(xs)
-                    all_ys.extend(ys)
-                    has_content = True
-            
-            # Also check ellipses (approximate bounding box)
+                if p.points:
+                    all_xs.extend([pt[0] for pt in p.points])
+                    all_ys.extend([pt[1] for pt in p.points])
             for e in cell.ellipses:
-                if e.layer in visible_names:
-                    all_xs.extend([e.rect[0], e.rect[0] + e.rect[2]])
-                    all_ys.extend([e.rect[1], e.rect[1] + e.rect[3]])
-                    has_content = True
+                all_xs.extend([e.rect[0], e.rect[0] + e.rect[2]])
+                all_ys.extend([e.rect[1], e.rect[1] + e.rect[3]])
 
-            if not has_content:
-                self.error_occurred.emit("No visible shapes found to simulate.")
+            if not all_xs:
+                self.error_occurred.emit("Canvas is empty.")
                 return
 
-            # Define bounds with a margin
             margin = 20.0
             min_x, max_x = min(all_xs) - margin, max(all_xs) + margin
             min_y, max_y = min(all_ys) - margin, max(all_ys) + margin
-            
-            real_w = max_x - min_x
-            real_h = max_y - min_y
+            real_w, real_h = max_x - min_x, max_y - min_y
 
-            # --- 2. Smart Resolution ---
-            # Fixed grid size of 256 on the longest side for performance
-            # This makes small chips look detailed and huge chips process fast.
-            target_dim = 256
+            # --- 2. Grid Setup ---
+            target_dim = 200 # Voxel resolution
             res = max(real_w, real_h) / target_dim
+            res = max(res, 0.1) # Safety
             
-            w = int(real_w / res)
-            h = int(real_h / res)
-            d = 60 # Z-depth resolution (layers)
-
-            self.progress_update.emit(10, f"Grid Size: {w}x{h}x{d}")
-
+            w, h = int(real_w / res), int(real_h / res)
+            d = 80 # Z-depth
+            
+            self.progress_update.emit(10, f"Simulating Volume: {w}x{h}x{d}")
             volume = np.zeros((w, h, d), dtype=np.uint8)
 
-            # --- 3. Generate Coordinate Grid ---
-            # Create a grid that exactly matches the bounded area
+            # Grid coordinates for rasterization
             x_space = np.linspace(min_x, max_x, w)
             y_space = np.linspace(min_y, max_y, h)
             xv, yv = np.meshgrid(x_space, y_space)
-            # Flatten for vectorized containment check
             grid_points = np.vstack((xv.flatten(), yv.flatten())).T
 
-            # --- 4. Substrate Initialization ---
-            sub_h = int(d * 0.15) # Bottom 15% is substrate
+            # --- 3. Substrate (Silicon) ---
+            sub_h = int(d * 0.2)
             volume[:, :, 0:sub_h] = 1 
             current_z = sub_h
 
-            # --- 5. Process Layers ---
-            mat_id = 2
-            total_layers = len(visible_layers)
-
-            for i, layer in enumerate(visible_layers):
-                msg = f"Processing: {layer.name}"
-                self.progress_update.emit(15 + int((i/total_layers)*80), msg)
-
-                # Collect polygons for THIS layer
-                polys = [p.points for p in cell.polygons if p.layer == layer.name]
-                
-                # Handle Ellipses for this layer (Convert to Path)
-                
-                ellipses = [e for e in cell.ellipses if e.layer == layer.name]
+            # Helper to get mask for a layer name
+            def get_layer_mask(layer_name):
+                polys = [p.points for p in cell.polygons if p.layer == layer_name]
+                # Add ellipse handling
+                ellipses = [e for e in cell.ellipses if e.layer == layer_name]
                 for e in ellipses:
-                    # Convert ellipse to polygon points (32 segments)
-                    cx, cy = e.rect[0] + e.rect[2]/2, e.rect[1] + e.rect[3]/2
-                    rx, ry = e.rect[2]/2, e.rect[3]/2
-                    theta = np.linspace(0, 2*np.pi, 32)
-                    ex = cx + rx * np.cos(theta)
-                    ey = cy + ry * np.sin(theta)
-                    pts = np.column_stack([ex, ey])
-                    polys.append(pts) # Add to the list to be processed
-                # --------------------------------------------------
+                    cx, cy = e.rect[0]+e.rect[2]/2, e.rect[1]+e.rect[3]/2
+                    th = np.linspace(0, 2*np.pi, 32)
+                    pts = np.column_stack([cx + e.rect[2]/2*np.cos(th), cy + e.rect[3]/2*np.sin(th)])
+                    polys.append(pts)
 
-                if not polys: continue
-                # ... (Simplified: Ellipses handled via bounding box above, 
-                # strict rasterization requires converting ellipse to polygon points here.
-                # For now, we rely on the user converting circles to polys or standard polys)
+                if not polys: return np.zeros((w, h), dtype=bool)
 
-                # Rasterize
-                layer_mask_flat = np.zeros(w*h, dtype=bool)
+                flat_mask = np.zeros(w*h, dtype=bool)
+                for p_pts in polys:
+                    path = mpath.Path(p_pts)
+                    flat_mask |= path.contains_points(grid_points)
+                return flat_mask.reshape(h, w).T
+
+            # --- 4. PROCESS SIMULATION LOOP ---
+            
+            # Define material mapping
+            # 1=Si, 2=Oxide, 3=Metal, 4=Poly, 5=Resist/Mask
+            mat_map = {l.name: i+2 for i, l in enumerate(self.project.layers)}
+            
+            # A. DEPOSITION & PATTERNING
+            # We treat visible layers as material being added
+            visible_layers = [l for l in self.project.layers if l.visible and not l.name.endswith('_doped')]
+            
+            for i, layer in enumerate(visible_layers):
+                self.progress_update.emit(20 + i, f"Depositing: {layer.name}")
                 
-                for p_points in polys:
-                    path = mpath.Path(p_points)
-                    # Determine which grid points are inside this polygon
-                    mask = path.contains_points(grid_points)
-                    layer_mask_flat |= mask
-                
-                layer_mask = layer_mask_flat.reshape(h, w).T # Reshape back to grid
+                mask_2d = get_layer_mask(layer.name)
+                if not np.any(mask_2d): continue
 
-                if not np.any(layer_mask): continue
+                # Realism: Blur
+                mask_float = gaussian_filter(mask_2d.astype(float), sigma=1.0)
+                mask_proc = mask_float > 0.5
+                dt = distance_transform_edt(mask_proc)
 
-                # Realism: Blur/Round
-                mask_float = layer_mask.astype(float)
-                mask_blurred = gaussian_filter(mask_float, sigma=1.0)
-                mask_processed = mask_blurred > 0.5
-
-                # Realism: Taper
-                dt = distance_transform_edt(mask_processed)
-                
-                # Thickness in voxels
+                # Taper Logic
                 thick_vox = max(1, int(layer.thickness_2_5d / res))
-                taper_angle = 10.0
+                mat_id = mat_map.get(layer.name, 2)
+                taper_angle = 8.0
 
                 for z in range(thick_vox):
                     z_idx = current_z + z
                     if z_idx >= d: break
-                    
                     erosion = z * np.tan(np.radians(taper_angle))
-                    # Solid if distance from edge > erosion amount
                     z_mask = dt > erosion
                     
-                    # Overwrite existing voxels
+                    # Standard Deposition: Overwrite air or stack on top
+                    # We only write if it's basically floating or on top of something
                     volume[z_mask, z_idx] = mat_id
-
+                
                 current_z += thick_vox
-                mat_id += 1
+
+            # B. ETCHING
+            # Look at the etch instructions stored in the cell
+            if hasattr(cell, 'etch_pairs'):
+                for i, (mask_layer, target_layer, depth) in enumerate(cell.etch_pairs):
+                    self.progress_update.emit(60 + i, f"Etching: {target_layer} using {mask_layer}")
+                    
+                    # 1. Get the etching mask (Where to remove)
+                    etch_mask_2d = get_layer_mask(mask_layer)
+                    if not np.any(etch_mask_2d): continue
+
+                    # 2. Identify target material ID
+                    target_id = mat_map.get(target_layer, -1)
+                    if target_id == -1: continue
+
+                    # 3. Convert depth to voxels
+                    depth_vox = max(1, int(depth / res))
+
+                    # 4. Apply Etch: Top-Down Removal
+                    # We iterate columns (x,y) where the mask is open
+                    rows, cols = np.where(etch_mask_2d)
+                    for r, c in zip(rows, cols):
+                        # Scan from top (d-1) down to 0
+                        removed_count = 0
+                        for z in range(d-1, -1, -1):
+                            val = volume[r, c, z]
+                            if val == target_id:
+                                volume[r, c, z] = 0 # Turn to Air
+                                removed_count += 1
+                                if removed_count >= depth_vox:
+                                    break
+                            elif val != 0 and val != target_id:
+                                # We hit a different material on top? 
+                                # Realistically, etch stops or slows. 
+                                # For now, we assume mask is on TOP of target.
+                                pass 
+
+            # C. DOPING
+            # Find layers named "_doped" (created by the Doping tool)
+            doped_layers = [l for l in self.project.layers if l.name.endswith('_doped')]
+            for d_layer in doped_layers:
+                self.progress_update.emit(80, f"Implanting: {d_layer.name}")
+                
+                # Get mask
+                dope_mask = get_layer_mask(d_layer.name)
+                
+                # Find the original material name (e.g., "Substrate_doped" -> "Substrate")
+                # But simpler: Just apply to Silicon (1)
+                
+                # Apply doping to Silicon (1) where mask is present
+                # We don't change shape, just ID.
+                # We assign a special high ID for doped regions to color them differently
+                doping_id = 99 
+                
+                # Vectorized update: Where mask is True AND volume is Silicon
+                # We assume doping goes somewhat deep (e.g., top 5 voxels of substrate)
+                target_indices = np.where((volume == 1) & (dope_mask[:, :, np.newaxis]))
+                volume[target_indices] = doping_id
 
             self.progress_update.emit(100, "Meshing...")
-            # Pass back volume, resolution, and the top-left corner offset
             self.finished_data.emit(volume, res, (min_x, min_y))
 
         except Exception as e:
+            import traceback
+            traceback.print_exc()
             self.error_occurred.emit(str(e))
 
 
@@ -1569,15 +1595,21 @@ class ThreeDViewDialog(QDialog):
         panel_layout.addStretch()
         main_layout.addWidget(panel, stretch=1)
 
-        # Materials colors
+        # Colors (R, G, B, Alpha)
         self.colors = [
-            (0, 0, 0, 0),
-            (0.6, 0.6, 0.6, 1),
-            (0.2, 0.4, 0.8, 0.6),
-            (0.8, 0.2, 0.2, 0.6),
-            (0.2, 0.8, 0.2, 0.6),
-            (0.9, 0.9, 0.2, 0.7),
+            (0,0,0,0),          # 0: Air
+            (0.6,0.6,0.6,1),    # 1: Silicon (Gray)
+            (0.2,0.4,0.8,0.6),  # 2: Blue Layer
+            (0.8,0.2,0.2,0.6),  # 3: Red Layer
+            (0.2,0.8,0.2,0.6),  # 4: Green Layer
+            (0.9,0.9,0.2,0.6),  # 5: Yellow Layer
+            (0.5,0.2,0.5,0.6),  # 6: Purple Layer
+            (1,1,1,1)           # ... padding
         ]
+        # Extend colors to handle high IDs like 99 (Doping)
+        # We create a dictionary mapping or just make the list huge
+        self.colors += [(0.5, 0.5, 0.5, 1)] * 100 
+        self.colors[99] = (0.8, 0.4, 0.0, 1.0) # 99: Doped Silicon (Orange)
 
 
     def _create_separator(self):
