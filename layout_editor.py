@@ -54,7 +54,7 @@ from PyQt5.QtWidgets import (
     QApplication, QMainWindow, QAction, QFileDialog, QColorDialog,
     QGraphicsView, QGraphicsScene, QGraphicsRectItem, QGraphicsPolygonItem,
     QGraphicsItem, QToolBar, QPushButton, QLabel, QLineEdit, QGridLayout,
-    QSpinBox, QCheckBox, QDialog, QVBoxLayout, QDialogButtonBox, QToolTip,
+    QSpinBox, QCheckBox, QDialog, QVBoxLayout, QDialogButtonBox, QToolTip, QProgressBar, QApplication,
     QDockWidget, QListWidget, QListWidgetItem, QWidget, QHBoxLayout, QMessageBox, QDoubleSpinBox, QGraphicsEllipseItem, QComboBox,
     QInputDialog, QTabWidget, QFrame, QToolButton, QGridLayout, QSlider, QGraphicsLineItem, QMenu, QGraphicsSceneMouseEvent, QOpenGLWidget
 )
@@ -1287,170 +1287,215 @@ class Canvas(QGraphicsView):
 
         event.acceptProposedAction()
 
+from PyQt5.QtCore import QThread, pyqtSignal
+
+# --- 1. The Worker Thread (Does the math in background) ---
+class SimulationWorker(QThread):
+    # Signals to update the UI
+    progress_update = pyqtSignal(int, str) # Percent, Message
+    finished_data = pyqtSignal(object, float) # The Volume array, Resolution used
+    error_occurred = pyqtSignal(str)
+
+    def __init__(self, project, width, height):
+        super().__init__()
+        self.project = project
+        self.canvas_w = width
+        self.canvas_h = height
+
+    def run(self):
+        try:
+            import numpy as np
+            from scipy.ndimage import distance_transform_edt, gaussian_filter
+            import matplotlib.path as mpath
+
+            # --- A. Auto-Calculate Resolution ---
+            # Target a grid width of roughly 200-300 voxels for speed
+            target_dim = 250
+            res = max(self.canvas_w / target_dim, self.canvas_h / target_dim)
+            res = max(res, 0.5) # Don't go below 0.5 units
+            
+            w = int(self.canvas_w / res)
+            h = int(self.canvas_h / res)
+            d = 60 # Z-depth fixed for demo
+            
+            self.progress_update.emit(5, f"Initializing Grid ({w}x{h}x{d})...")
+            
+            volume = np.zeros((w, h, d), dtype=np.uint8)
+            
+            # --- B. Grid Setup ---
+            # Coordinate grid for rasterization
+            x = np.linspace(0, self.canvas_w, w)
+            y = np.linspace(0, self.canvas_h, h)
+            xv, yv = np.meshgrid(x, y)
+            grid_points = np.vstack((xv.flatten(), yv.flatten())).T
+
+            # --- C. Substrate ---
+            sub_h = int(d * 0.2)
+            volume[:, :, 0:sub_h] = 1 
+            current_z = sub_h
+
+            # --- D. Process Layers ---
+            mat_id = 2
+            visible_layers = [l for l in self.project.layers if l.visible]
+            total_steps = len(visible_layers)
+
+            for i, layer in enumerate(visible_layers):
+                msg = f"Processing Layer: {layer.name}"
+                percent = 10 + int((i / total_steps) * 80)
+                self.progress_update.emit(percent, msg)
+
+                # 1. Rasterize (Vector -> 2D Grid)
+                polys = [p.points for p in self.project.cells[self.project.top].polygons if p.layer == layer.name]
+                if not polys: continue
+
+                layer_mask = np.zeros((w, h), dtype=bool)
+                for p_points in polys:
+                    path = mpath.Path(p_points)
+                    # Create boolean mask
+                    mask = path.contains_points(grid_points).reshape(h, w).T
+                    layer_mask |= mask
+                
+                if not np.any(layer_mask): continue
+
+                # 2. Apply Realism (Rounding)
+                mask_float = layer_mask.astype(float)
+                mask_blurred = gaussian_filter(mask_float, sigma=1.0) # Lower sigma for speed
+                mask_processed = mask_blurred > 0.5
+
+                # 3. Apply Taper (Distance Field)
+                dt = distance_transform_edt(mask_processed)
+                thickness = max(1, int(layer.thickness_2_5d / res))
+                taper_angle = 12.0
+
+                # 4. Stack Volume
+                for z in range(thickness):
+                    z_idx = current_z + z
+                    if z_idx >= d: break
+                    erosion = z * np.tan(np.radians(taper_angle))
+                    z_mask = dt > erosion
+                    volume[z_mask, z_idx] = mat_id
+
+                current_z += thickness
+                mat_id += 1
+
+            self.progress_update.emit(100, "Finalizing Mesh...")
+            self.finished_data.emit(volume, res)
+
+        except Exception as e:
+            self.error_occurred.emit(str(e))
+
+
+# --- 2. The Main View Dialog ---
 class ThreeDViewDialog(QDialog):
     def __init__(self, project, parent=None):
         super().__init__(parent)
-        self.setWindowTitle("High-Fidelity 3D View (Level Set / SDF)")
+        self.setWindowTitle("High-Fidelity 3D View")
         self.resize(1200, 900)
         self.project = project
-        
-        # Grid Resolution (Lower = Smoother but slower)
-        self.res = 2.0 
-        
-        # Dimensions setup
-        self.w = int(self.project.canvas_width / self.res)
-        self.h = int(self.project.canvas_height / self.res)
-        self.d = 100 # Vertical resolution
-        
-        # The Volume Grid: Stores 'Material ID' for every point
-        self.volume = np.zeros((self.w, self.h, self.d), dtype=np.uint8)
-        
-        # Layout
+        self.worker = None
+
         layout = QVBoxLayout(self)
-        
-        # 3D Widget
+
+        # 3D Viewport
         if _has_3d_deps:
             self.gl_view = gl.GLViewWidget()
-            self.gl_view.opts['distance'] = 200
+            self.gl_view.opts['distance'] = 150
             self.gl_view.setBackgroundColor('#202020')
+            
+            # Add a floor grid for reference
+            g = gl.GLGridItem()
+            g.scale(20, 20, 1)
+            self.gl_view.addItem(g)
+            
             layout.addWidget(self.gl_view)
         else:
             layout.addWidget(QLabel("Error: Missing pyqtgraph/skimage/scipy"))
 
-        # Controls
-        ctrl = QHBoxLayout()
-        btn = QPushButton("Generate Realistic Model"); btn.clicked.connect(self.run_realistic_build)
-        ctrl.addWidget(btn)
-        layout.addLayout(ctrl)
+        # Progress Bar
+        self.progress_bar = QProgressBar()
+        self.progress_bar.setVisible(False)
+        layout.addWidget(self.progress_bar)
+        
+        # Status Label
+        self.status_label = QLabel("Ready")
+        layout.addWidget(self.status_label)
 
-        # Colors (R, G, B, Alpha)
+        # Button
+        self.btn_run = QPushButton("Generate 3D Model")
+        self.btn_run.clicked.connect(self.start_simulation)
+        layout.addWidget(self.btn_run)
+
+        # Colors
         self.colors = [
-            (0,0,0,0),          # 0: Air
-            (0.6,0.6,0.6,1),    # 1: Silicon Substrate
-            (0.2,0.4,0.8,0.6),  # 2: Oxide (Blueish)
-            (0.8,0.2,0.2,0.6),  # 3: Metal (Redish)
-            (0.2,0.8,0.2,0.6),  # 4: Nitride (Greenish)
-            (0.9,0.9,0.2,0.7)   # 5: Photoresist (Yellow)
+            (0,0,0,0), (0.6,0.6,0.6,1), (0.2,0.4,0.8,0.6), 
+            (0.8,0.2,0.2,0.6), (0.2,0.8,0.2,0.6), (0.9,0.9,0.2,0.7)
         ]
 
-    def run_realistic_build(self):
-        """Simulates the process stack using Signed Distance Fields (SDF)."""
-        from scipy.ndimage import distance_transform_edt, gaussian_filter
-
-        print("Starting Simulation...")
-        self.volume[:] = 0
-        self.gl_view.clear()
+    def start_simulation(self):
+        # Disable button, show progress
+        self.btn_run.setEnabled(False)
+        self.progress_bar.setValue(0)
+        self.progress_bar.setVisible(True)
+        self.gl_view.items = [i for i in self.gl_view.items if isinstance(i, gl.GLGridItem)] # Clear old mesh
         
-        # 1. Initialize Substrate (Bottom 20% of Z-stack)
-        sub_h = int(self.d * 0.2)
-        self.volume[:, :, 0:sub_h] = 1 
-        current_z = sub_h
+        # Start Worker
+        self.worker = SimulationWorker(self.project, self.project.canvas_width, self.project.canvas_height)
+        self.worker.progress_update.connect(self.on_progress)
+        self.worker.finished_data.connect(self.on_finished)
+        self.worker.error_occurred.connect(self.on_error)
+        self.worker.start()
 
-        # 2. Process Layers
-        mat_id = 2
-        for layer in self.project.layers:
-            if not layer.visible: continue
-            
-            # --- A. Get 2D Mask ---
-            # Rasterize vector polygons to a 2D boolean grid
-            mask_2d = self.get_layer_mask(layer.name)
-            if not np.any(mask_2d): continue
+    def on_progress(self, percent, message):
+        self.progress_bar.setValue(percent)
+        self.status_label.setText(message)
 
-            # --- B. REALISM: Rounded Corners (Lithography smoothing) ---
-            # Apply Gaussian Blur to the boolean mask to round sharp corners
-            # before extruding. This simulates light diffraction limits.
-            mask_float = mask_2d.astype(float)
-            mask_blurred = gaussian_filter(mask_float, sigma=2.0) # sigma controls rounding
-            mask_processed = mask_blurred > 0.5 # Re-binarize
+    def on_error(self, msg):
+        self.status_label.setText(f"Error: {msg}")
+        self.btn_run.setEnabled(True)
+        self.progress_bar.setVisible(False)
 
-            # --- C. REALISM: Tapered Walls ---
-            # Calculate Distance Transform (SDF) of the mask
-            # dt is the distance from any pixel to the nearest edge
-            dt = distance_transform_edt(mask_processed)
-            
-            # Layer settings
-            thickness = int(layer.thickness_2_5d / self.res)
-            taper_angle = 10.0 # Degrees (0 = Vertical, >0 = Pyramidal)
-            
-            # --- D. Volumetric Stacking ---
-            for z in range(thickness):
-                z_idx = current_z + z
-                if z_idx >= self.d: break
-                
-                # Calculate erosion based on height (Taper Math)
-                # Higher up in Z = more erosion (taper in)
-                erosion_amount = z * np.tan(np.radians(taper_angle))
-                
-                # Create the mask for this specific Z-slice
-                # Pixels are solid if they are "deep enough" inside the shape
-                # relative to how high up (Z) we are.
-                z_mask = dt > erosion_amount
-                
-                # Apply material to volume
-                # Only write where not already solid (simple deposition)
-                # or overwrite if needed.
-                self.volume[z_mask, z_idx] = mat_id
-
-            current_z += thickness
-            mat_id += 1
-
-        self.render_volume()
-
-    def render_volume(self):
-        """Uses Marching Cubes to render the Isosurfaces."""
-        if not _has_3d_deps:
-            print("Error: 3D dependencies missing.")
-            return
-
-        unique_mats = np.unique(self.volume)
+    def on_finished(self, volume, res):
+        self.status_label.setText("Rendering Meshes...")
+        QApplication.processEvents() # Allow UI to update text
         
-        for mid in unique_mats:
-            if mid == 0: continue
+        try:
+            unique_mats = np.unique(volume)
             
-            # Isolate material
-            mat_vol = (self.volume == mid).astype(float)
-            
-            # Smooth the VOLUME to blend layers
-            from scipy.ndimage import gaussian_filter
-            mat_vol = gaussian_filter(mat_vol, sigma=0.5) 
-            
-            try:
-                # Use the 'measure' module from skimage
+            for mid in unique_mats:
+                if mid == 0: continue
+                
+                # Create mask for this material
+                mat_vol = (volume == mid).astype(float)
+                
+                # Smooth for nicer visuals
+                from scipy.ndimage import gaussian_filter
+                mat_vol = gaussian_filter(mat_vol, sigma=0.5) 
+                
+                # Marching Cubes
                 verts, faces, _, _ = measure.marching_cubes(mat_vol, level=0.5)
                 
-                # Scale vertices back to real-world units
-                verts[:, 0] *= self.res # X
-                verts[:, 1] *= self.res # Y
+                # Scale vertices to world coordinates
+                verts[:, 0] *= res
+                verts[:, 1] *= res
+                verts[:, 2] *= 2.0 # Arbitrary Z-scale for visualization
                 
-                # Scale Z (approximate based on layer thickness)
-                # You might need to adjust this factor based on your exact Z-unit logic
-                verts[:, 2] *= 1.0 
+                # Center the model
+                verts[:, 0] -= (volume.shape[0] * res) / 2
+                verts[:, 1] -= (volume.shape[1] * res) / 2
                 
                 mesh = gl.GLMeshItem(vertexes=verts, faces=faces, 
                                      color=self.colors[mid % len(self.colors)],
                                      shader='shaded', smooth=True, 
                                      glOptions='translucent')
                 self.gl_view.addItem(mesh)
-            except Exception as e:
-                print(f"Mesh generation failed for material {mid}: {e}")
-
-    def get_layer_mask(self, layer_name):
-        """Standard rasterization (same as before)."""
-        import matplotlib.path as mpath
-        cell = self.project.cells[self.project.top]
-        x = np.linspace(0, self.project.canvas_width, self.w)
-        y = np.linspace(0, self.project.canvas_height, self.h)
-        xv, yv = np.meshgrid(x, y)
-        points = np.vstack((xv.flatten(), yv.flatten())).T
-        
-        polys = [p.points for p in cell.polygons if p.layer == layer_name]
-        full_mask = np.zeros((self.w, self.h), dtype=bool)
-        
-        for p_points in polys:
-            path = mpath.Path(p_points)
-            mask = path.contains_points(points).reshape(self.h, self.w).T
-            full_mask |= mask
-        return full_mask
+            
+            self.status_label.setText("Simulation Complete.")
+            
+        except Exception as e:
+            self.status_label.setText(f"Rendering Error: {str(e)}")
+            
+        self.btn_run.setEnabled(True)
+        self.progress_bar.setVisible(False)
 
 # -------------------------- Main window --------------------------
 
