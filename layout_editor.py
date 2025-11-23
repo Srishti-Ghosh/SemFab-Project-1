@@ -4,34 +4,58 @@ import json
 import copy
 import uuid
 import os
+import skimage
 from dataclasses import dataclass, asdict, field, is_dataclass
 from typing import Dict, List, Tuple, Optional
 from uuid import UUID
-
+# --- 3D Dependencies ---
+try:
+    import pyqtgraph.opengl as gl
+    from skimage import measure  # <--- Defines 'measure'
+    import numpy as np
+    _has_3d_deps = True          # <--- Defines '_has_3d_deps'
+except ImportError:
+    print("Warning: 3D libraries (pyqtgraph, skimage) not found.")
+    _has_3d_deps = False
+    measure = None
+    gl = None
 # This is a stub for the gdstk library if it's not installed.
 # For full functionality, install it: pip install gdstk
 try:
     import gdstk
 except ImportError:
-    print("Warning: gdstk library not found. GDS/OAS, fillet, and boolean features will be disabled.")
+    print("Warning: gdstk library not found. GDS/OAS, fillet, boolean features, and some simulation aspects will be disabled.")
     gdstk = None
 
-# Added for the 3D view logic
+# Added for the 2_5d view logic and Level Set
 try:
     from matplotlib.path import Path
 except ImportError:
-    print("Warning: matplotlib library not found. 3D view will be disabled.")
+    print("Warning: matplotlib library not found. 2.5D view and Level Set initialization will be disabled.")
     Path = None
 
-from PyQt5.QtCore import Qt, QRectF, QPointF, QSize, QMimeData, pyqtSignal, QLineF, QUrl
-from PyQt5.QtGui import (QBrush, QPen, QColor, QPolygonF, QPainter, QPixmap, QIcon, QPainterPath,
+# Added for Level Set Simulation
+try:
+    from scipy.ndimage import distance_transform_edt
+    from skimage.measure import find_contours
+    _has_level_set_deps = True
+except ImportError:
+    print("Warning: numpy, scipy, or scikit-image not found. Level Set simulation features will be disabled. 3D Voxel View disabled.")
+    np = None
+    distance_transform_edt = None
+    find_contours = None
+    _has_level_set_deps = False
+
+
+from PyQt5.QtCore import Qt, QRectF, QPointF, QSize, QSizeF, QMimeData, pyqtSignal, QLineF, QUrl
+from PyQt5.QtGui import (QBrush, QPen, QColor, QPolygonF, QCursor, QPainter, QPixmap, QIcon, QPainterPath,
                          QDrag, QPalette, QFont, QTransform, QDesktopServices)
 from PyQt5.QtWidgets import (
     QApplication, QMainWindow, QAction, QFileDialog, QColorDialog,
     QGraphicsView, QGraphicsScene, QGraphicsRectItem, QGraphicsPolygonItem,
-    QGraphicsItem, QToolBar, QPushButton, QLabel, QLineEdit,
+    QGraphicsItem, QToolBar, QPushButton, QLabel, QLineEdit, QGridLayout,
     QSpinBox, QCheckBox, QDialog, QVBoxLayout, QDialogButtonBox, QToolTip,
-    QDockWidget, QListWidget, QListWidgetItem, QWidget, QHBoxLayout, QMessageBox, QDoubleSpinBox, QGraphicsEllipseItem, QComboBox, 
+    QDockWidget, QListWidget, QListWidgetItem, QWidget, QHBoxLayout, QMessageBox, QDoubleSpinBox, QGraphicsEllipseItem, QComboBox,
     QInputDialog, QTabWidget, QFrame, QToolButton, QGridLayout, QSlider, QGraphicsLineItem, QMenu, QGraphicsSceneMouseEvent, QOpenGLWidget
 )
 from PyQt5.QtSvg import QSvgGenerator
@@ -43,6 +67,8 @@ class Layer:
     name: str
     color: Tuple[int, int, int]
     visible: bool = True
+    fill_pattern: str = "solid"  # <-- ADDED for mask styling
+    thickness_2_5d: float = 10.0 # <-- ADDED for 2.5D view
 
 @dataclass(eq=False)
 class Poly:
@@ -105,7 +131,7 @@ class WelcomeDialog(QDialog):
         layout.setSpacing(10)
 
         logo_label = QLabel()
-        logo_pixmap = self._create_themed_icon("layout", 64) 
+        logo_pixmap = self._create_themed_icon("layout", 64)
         logo_label.setPixmap(logo_pixmap.pixmap(QSize(64, 64)))
         logo_label.setAlignment(Qt.AlignCenter)
         layout.addWidget(logo_label)
@@ -125,11 +151,11 @@ class WelcomeDialog(QDialog):
         is_dark_theme = self.palette().color(QPalette.Window).value() < 128
         hover_color = "#404040" if is_dark_theme else "#F0F0F0"
         border_color = "#555" if is_dark_theme else "#CCC"
-        
+
         button_stylesheet = f"""
             QPushButton {{
-                padding: 12px; 
-                text-align: left; 
+                padding: 12px;
+                text-align: left;
                 font-size: 13px;
                 background-color: transparent;
                 border: 1px solid {border_color};
@@ -256,10 +282,10 @@ class FilletDialog(QDialog):
         self.radius_spin = QDoubleSpinBox()
         self.radius_spin.setDecimals(3) # Allow for more precision
         self.radius_spin.setRange(0.001, 10000.0)
-        
+
         # Set the spinbox's value to the passed-in default
         self.radius_spin.setValue(default_radius)
-        
+
         layout.addWidget(self.radius_spin)
         buttons = QDialogButtonBox(QDialogButtonBox.Ok | QDialogButtonBox.Cancel)
         buttons.accepted.connect(self.accept); buttons.rejected.connect(self.reject)
@@ -267,7 +293,8 @@ class FilletDialog(QDialog):
 
     def get_radius(self): return self.radius_spin.value()
 
-class Interactive3DView(QGraphicsView):
+# RENAMED from Interactive3DView
+class Interactive2_5dView(QGraphicsView):
     def __init__(self, scene, parent_dialog):
         super().__init__(scene)
         self.parent_dialog = parent_dialog
@@ -288,7 +315,7 @@ class Interactive3DView(QGraphicsView):
             delta = event.pos() - self._last_pan_point
             self.parent_dialog.angle_y += delta.x() * 0.5
             self.parent_dialog.angle_x += delta.y() * 0.5
-            self.parent_dialog.draw_3d_view()
+            self.parent_dialog.draw_2_5d_view() # RENAMED
         self._last_pan_point = event.pos()
         super().mouseMoveEvent(event)
 
@@ -299,13 +326,14 @@ class Interactive3DView(QGraphicsView):
     def wheelEvent(self, event):
         zoom_factor = 1.1 if event.angleDelta().y() > 0 else 1 / 1.1
         self.parent_dialog.zoom_scale *= zoom_factor
-        self.parent_dialog.draw_3d_view()
+        self.parent_dialog.draw_2_5d_view() # RENAMED
 
-class ThreeDViewDialog(QDialog):
+# RENAMED from ThreeDViewDialog
+class TwoPointFiveDViewDialog(QDialog):
     def __init__(self, project, parent=None):
         super().__init__(parent)
         self.project = project
-        self.setWindowTitle("Interactive 3D Preview")
+        self.setWindowTitle("Interactive 2.5D Preview") # RENAMED
         base_height = 500
         height_per_layer = 30
         num_layers = len(self.project.layers)
@@ -313,7 +341,8 @@ class ThreeDViewDialog(QDialog):
         self.setGeometry(100, 100, 800, dynamic_height)
 
         self.angle_x, self.angle_y, self.zoom_scale = 35.0, -45.0, 1.0
-        self.layer_thicknesses = {layer.name: getattr(layer, 'thickness_3d', 10) for layer in self.project.layers}
+        # RENAMED attribute
+        self.layer_thicknesses = {layer.name: getattr(layer, 'thickness_2_5d', 10) for layer in self.project.layers}
         self.sliders = {}
 
         main_layout = QVBoxLayout(self)
@@ -322,15 +351,16 @@ class ThreeDViewDialog(QDialog):
         top_panel_layout.setContentsMargins(0, 0, 0, 0)
         sliders_frame = QFrame(); sliders_frame.setFrameShape(QFrame.StyledPanel)
         sliders_layout = QGridLayout(sliders_frame)
-        sliders_layout.addWidget(QLabel("<b>Layer Thickness (%)</b>"), 0, 0, 1, 3)
+        sliders_layout.addWidget(QLabel("<b>Layer Thickness (units)</b>"), 0, 0, 1, 3) # Changed label
         row = 1
         for layer in self.project.layers:
             label, slider = QLabel(layer.name), QSlider(Qt.Horizontal)
-            seed = getattr(layer, 'thickness_3d', self.layer_thicknesses.get(layer.name, 10))
+            # RENAMED attribute
+            seed = getattr(layer, 'thickness_2_5d', self.layer_thicknesses.get(layer.name, 10))
             seed_int = max(1, int(round(seed)))
             slider.setRange(1, max(100, seed_int)); slider.setValue(seed_int)
             slider.valueChanged.connect(self.on_slider_change)
-            value_label = QLabel(f"{slider.value()}%")
+            value_label = QLabel(f"{slider.value()}") # Changed label
             slider.value_label = value_label
             sliders_layout.addWidget(label, row, 0)
             sliders_layout.addWidget(slider, row, 1)
@@ -342,7 +372,7 @@ class ThreeDViewDialog(QDialog):
         views_layout = QVBoxLayout(views_frame)
         views_layout.addWidget(QLabel("<b>Standard Views & Actions</b>"))
         btn_grid = QGridLayout()
-        btn_iso, btn_top = QPushButton("3D / Iso"), QPushButton("Top")
+        btn_iso, btn_top = QPushButton("2.5D / Iso"), QPushButton("Top") # RENAMED
         btn_front, btn_side = QPushButton("Front"), QPushButton("Side")
         btn_iso.clicked.connect(self.set_iso_view); btn_top.clicked.connect(self.set_top_view)
         btn_front.clicked.connect(self.set_front_view); btn_side.clicked.connect(self.set_side_view)
@@ -355,37 +385,36 @@ class ThreeDViewDialog(QDialog):
         main_layout.addWidget(top_panel)
 
         self.scene = QGraphicsScene()
-        self.view = Interactive3DView(self.scene, self)
+        self.view = Interactive2_5dView(self.scene, self) # RENAMED
         main_layout.addWidget(self.view)
-        
-        self.draw_3d_view(fit_view=True)
+
+        self.draw_2_5d_view(fit_view=True) # RENAMED
 
     def set_view_angles(self, x, y):
         self.angle_x, self.angle_y = x, y
         self.zoom_scale = 1.0
-        self.draw_3d_view(fit_view=True)
-    
+        self.draw_2_5d_view(fit_view=True) # RENAMED
+
     def set_iso_view(self): self.set_view_angles(35.0, -45.0)
     def set_top_view(self): self.set_view_angles(0, 0)
     def set_front_view(self): self.set_view_angles(-90, 0)
     def set_side_view(self): self.set_view_angles(0, -90)
 
     def save_image(self):
-        path, _ = QFileDialog.getSaveFileName(self, "Save Image", "3d_view.png", "PNG (*.png);;JPG (*.jpg)")
+        path, _ = QFileDialog.getSaveFileName(self, "Save Image", "2_5d_view.png", "PNG (*.png);;JPG (*.jpg)") # RENAMED default filename
         if path and not self.view.grab().save(path):
             QMessageBox.warning(self, "Save Error", f"Could not save image to:\n{path}")
 
-    # --- CORRECTED METHOD DEFINITION ---
     def on_slider_change(self):
         for name, slider in self.sliders.items():
             self.layer_thicknesses[name] = slider.value()
-            slider.value_label.setText(f"{slider.value()}")
+            slider.value_label.setText(f"{slider.value()}") # Changed label
 
             layer = next((l for l in self.project.layers if l.name == name), None)
             if layer:
-                layer.thickness_3d = float(slider.value())
+                layer.thickness_2_5d = float(slider.value()) # RENAMED attribute
 
-        self.draw_3d_view()
+        self.draw_2_5d_view() # RENAMED
 
     def project_point(self, x, y, z):
         view_size = self.view.viewport().size()
@@ -400,9 +429,10 @@ class ThreeDViewDialog(QDialog):
 
     def resizeEvent(self, event):
         super().resizeEvent(event)
-        self.draw_3d_view()
+        self.draw_2_5d_view() # RENAMED
 
-    def draw_3d_view(self, fit_view=False):
+    # RENAMED from draw_3d_view
+    def draw_2_5d_view(self, fit_view=False):
         self.scene.clear()
 
         def get_all_shapes_as_polygons(cell, origin=(0, 0), rotation=0, mag=1.0):
@@ -417,34 +447,38 @@ class ThreeDViewDialog(QDialog):
                 if (layer := self.project.layer_by_name.get(e_data.layer)) and layer.visible:
                     rect = QRectF(*e_data.rect)
                     poly = QPolygonF([QPointF(rect.center().x() + rect.width()/2 * math.cos(i/16*math.pi),
-                                            rect.center().y() + rect.height()/2 * math.sin(i/16*math.pi)) for i in range(32)])
+                                              rect.center().y() + rect.height()/2 * math.sin(i/16*math.pi)) for i in range(32)])
                     shapes.append((e_data.layer, [(p.x(), p.y()) for p in t.map(poly)]))
             for ref in cell.references:
                 if ref.cell in self.project.cells:
                     ref_origin_transformed = t.map(QPointF(*ref.origin))
                     shapes.extend(get_all_shapes_as_polygons(self.project.cells[ref.cell],
-                                                        (ref_origin_transformed.x(), ref_origin_transformed.y()),
-                                                        ref.rotation + rotation,
-                                                        ref.magnification * mag))
+                                                              (ref_origin_transformed.x(), ref_origin_transformed.y()),
+                                                              ref.rotation + rotation,
+                                                              ref.magnification * mag))
             return shapes
 
         # === PASS 1: Calculate all final 2D geometric primitives ===
         all_shapes = get_all_shapes_as_polygons(self.project.cells[self.project.top])
         if not all_shapes: return
 
-        active_cell_3d = self.project.cells[self.project.top]
+        active_cell_2_5d = self.project.cells[self.project.top]
         geometric_primitives = []
-        if gdstk and hasattr(active_cell_3d, 'etch_pairs') and active_cell_3d.etch_pairs:
+        if gdstk and hasattr(active_cell_2_5d, 'etch_pairs') and active_cell_2_5d.etch_pairs:
             etch_masks = {}
             used_mask_layers = set()
-            for mask, sub, depth in active_cell_3d.etch_pairs:
+            for mask, sub, depth in active_cell_2_5d.etch_pairs:
                 used_mask_layers.add(mask)
                 if sub not in etch_masks: etch_masks[sub] = []
-                etch_masks[sub].extend([(gdstk.Polygon(p), depth) for L, p in all_shapes if L == mask])
-            
+                # Ensure points are valid before creating gdstk.Polygon
+                valid_polys = [gdstk.Polygon(p) for L, p in all_shapes if L == mask and p]
+                etch_masks[sub].extend([(poly, depth) for poly in valid_polys])
+
+
             for layer_name, points in all_shapes:
                 if layer_name in used_mask_layers: continue
-                
+                if not points: continue # Skip empty polygons
+
                 if layer_name in etch_masks and etch_masks[layer_name]:
                     substrate_poly = gdstk.Polygon(points)
                     masks_for_sub = [m[0] for m in etch_masks[layer_name]]
@@ -453,103 +487,111 @@ class ThreeDViewDialog(QDialog):
                     un_etched = gdstk.boolean(substrate_poly, masks_for_sub, 'not')
                     cavity_floors = gdstk.boolean(substrate_poly, masks_for_sub, 'and')
 
-                    for part in un_etched: geometric_primitives.append({'layer': layer_name, 'points': part.points.tolist(), 'mod': 0})
-                    for floor in cavity_floors: geometric_primitives.append({'layer': layer_name, 'points': floor.points.tolist(), 'mod': -depth})
+                    # Handle cases where boolean might return non-list
+                    if isinstance(un_etched, gdstk.Polygon): un_etched = [un_etched]
+                    if isinstance(cavity_floors, gdstk.Polygon): cavity_floors = [cavity_floors]
+
+                    for part in un_etched or []: geometric_primitives.append({'layer': layer_name, 'points': part.points.tolist(), 'mod': 0})
+                    for floor in cavity_floors or []: geometric_primitives.append({'layer': layer_name, 'points': floor.points.tolist(), 'mod': -depth})
                 else:
                     geometric_primitives.append({'layer': layer_name, 'points': points, 'mod': 0})
         else:
-            geometric_primitives = [{'layer': l, 'points': p, 'mod': 0} for l, p in all_shapes]
+            geometric_primitives = [{'layer': l, 'points': p, 'mod': 0} for l, p in all_shapes if p] # Ensure points exist
 
         if not geometric_primitives: return
-        
+
         # === PASS 2: Build the complete, final height map from the primitives ===
         height_map = {}
-        grid_step = 20.0
+        grid_step = 20.0 # Adjust for accuracy vs performance
         layer_order = {layer.name: i for i, layer in enumerate(self.project.layers)}
         geometric_primitives.sort(key=lambda s: layer_order.get(s['layer'], -1))
 
-        for shape in geometric_primitives:
-            layer_name, points_2d, thickness_mod = shape['layer'], shape['points'], shape['mod']
-            layer = self.project.layer_by_name.get(layer_name)
-            if not layer or not Path or not points_2d: continue
-            
-            full_thickness = self.layer_thicknesses.get(layer_name, 10)
-            thickness = max(0, full_thickness + thickness_mod)
-            path = Path(points_2d)
+        if Path: # Check if Path is available
+            for shape in geometric_primitives:
+                layer_name, points_2d, thickness_mod = shape['layer'], shape['points'], shape['mod']
+                layer = self.project.layer_by_name.get(layer_name)
+                if not layer or not points_2d: continue
 
-            p_min_x_g = int(min(p[0] for p in points_2d) // grid_step)
-            p_max_x_g = int(max(p[0] for p in points_2d) // grid_step)
-            p_min_y_g = int(min(p[1] for p in points_2d) // grid_step)
-            p_max_y_g = int(max(p[1] for p in points_2d) // grid_step)
-            
-            for gx in range(p_min_x_g, p_max_x_g + 1):
-                for gy in range(p_min_y_g, p_max_y_g + 1):
-                    if path.contains_point(((gx + 0.5) * grid_step, (gy + 0.5) * grid_step)):
-                        base_z = height_map.get((gx, gy), 0)
-                        height_map[(gx, gy)] = base_z + thickness
+                full_thickness = self.layer_thicknesses.get(layer_name, 10)
+                thickness = max(0, full_thickness + thickness_mod)
+                path = Path(points_2d)
 
-        # === PASS 3: Render all faces using the final height map ===
+                try:
+                    p_min_x_g = int(min(p[0] for p in points_2d) // grid_step)
+                    p_max_x_g = int(max(p[0] for p in points_2d) // grid_step)
+                    p_min_y_g = int(min(p[1] for p in points_2d) // grid_step)
+                    p_max_y_g = int(max(p[1] for p in points_2d) // grid_step)
+                except ValueError: # Handle empty points list
+                    continue
+
+                for gx in range(p_min_x_g, p_max_x_g + 1):
+                    for gy in range(p_min_y_g, p_max_y_g + 1):
+                        if path.contains_point(((gx + 0.5) * grid_step, (gy + 0.5) * grid_step)):
+                            base_z = height_map.get((gx, gy), 0)
+                            height_map[(gx, gy)] = base_z + thickness
+
         all_faces = []
-        all_points_flat = [pt for shape in geometric_primitives for pt in shape['points']]
-        min_x, max_x = min(p[0] for p in all_points_flat), max(p[0] for p in all_points_flat)
-        min_y, max_y = min(p[1] for p in all_points_flat), max(p[1] for p in all_points_flat)
+        try:
+            all_points_flat = [pt for shape in geometric_primitives for pt in shape['points']]
+            if not all_points_flat: return # Nothing to render
+            min_x, max_x = min(p[0] for p in all_points_flat), max(p[0] for p in all_points_flat)
+            min_y, max_y = min(p[1] for p in all_points_flat), max(p[1] for p in all_points_flat)
+        except ValueError: # Handle case where geometric_primitives is empty
+            return
         center_x, center_y = (min_x + max_x) / 2, (min_y + max_y) / 2
 
-        # Re-build the height map from scratch for this pass to get base_z values
-        render_height_map = {} 
-        for shape in geometric_primitives:
-            layer_name, points_2d, thickness_mod = shape['layer'], shape['points'], shape['mod']
-            layer = self.project.layer_by_name.get(layer_name)
-            if not layer or not layer.visible or not Path or not points_2d: continue
+        render_height_map = {}
+        if Path: # Check if Path is available
+            for shape in geometric_primitives:
+                layer_name, points_2d, thickness_mod = shape['layer'], shape['points'], shape['mod']
+                layer = self.project.layer_by_name.get(layer_name)
+                if not layer or not layer.visible or not points_2d: continue
 
-            full_thickness = self.layer_thicknesses.get(layer_name, 10)
-            thickness = max(0, full_thickness + thickness_mod)
-            color = QColor(*layer.color)
+                full_thickness = self.layer_thicknesses.get(layer_name, 10)
+                thickness = max(0, full_thickness + thickness_mod)
+                color = QColor(*layer.color)
 
-            base_z = 0
-            path = Path(points_2d)
-            p_min_x_g = int(min(p[0] for p in points_2d) // grid_step)
-            p_max_x_g = int(max(p[0] for p in points_2d) // grid_step)
-            p_min_y_g = int(min(p[1] for p in points_2d) // grid_step)
-            p_max_y_g = int(max(p[1] for p in points_2d) // grid_step)
+                base_z = 0
+                path = Path(points_2d)
+                try:
+                    p_min_x_g = int(min(p[0] for p in points_2d) // grid_step)
+                    p_max_x_g = int(max(p[0] for p in points_2d) // grid_step)
+                    p_min_y_g = int(min(p[1] for p in points_2d) // grid_step)
+                    p_max_y_g = int(max(p[1] for p in points_2d) // grid_step)
+                except ValueError: continue
 
-            # Find the single base_z for this primitive
-            footprint_z_values = [0]
-            for gx in range(p_min_x_g, p_max_x_g + 1):
-                for gy in range(p_min_y_g, p_max_y_g + 1):
-                    if path.contains_point(((gx + 0.5) * grid_step, (gy + 0.5) * grid_step)):
-                        footprint_z_values.append(render_height_map.get((gx, gy), 0))
-            base_z = max(footprint_z_values)
+                footprint_z_values = [0]
+                for gx in range(p_min_x_g, p_max_x_g + 1):
+                    for gy in range(p_min_y_g, p_max_y_g + 1):
+                        if path.contains_point(((gx + 0.5) * grid_step, (gy + 0.5) * grid_step)):
+                            footprint_z_values.append(render_height_map.get((gx, gy), 0))
+                base_z = max(footprint_z_values)
 
-            # Create faces
-            centered_pts = [(p[0] - center_x, p[1] - center_y) for p in points_2d]
-            floor_pts = [(*p, base_z) for p in centered_pts]
-            ceiling_pts = [(*p, base_z + thickness) for p in centered_pts]
-            all_faces.append((ceiling_pts, color.lighter(110)))
-            if base_z > 0: all_faces.append((floor_pts, color.darker(120)))
-            for i in range(len(floor_pts)):
-                p1, p2 = floor_pts[i], floor_pts[(i + 1) % len(floor_pts)]
-                p3, p4 = ceiling_pts[(i + 1) % len(floor_pts)], ceiling_pts[i]
-                all_faces.append(([p1, p2, p3, p4], color))
+                centered_pts = [(p[0] - center_x, p[1] - center_y) for p in points_2d]
+                floor_pts = [(*p, base_z) for p in centered_pts]
+                ceiling_pts = [(*p, base_z + thickness) for p in centered_pts]
+                all_faces.append((ceiling_pts, color.lighter(110)))
+                if base_z > 0: all_faces.append((floor_pts, color.darker(120)))
+                for i in range(len(floor_pts)):
+                    p1, p2 = floor_pts[i], floor_pts[(i + 1) % len(floor_pts)]
+                    p3, p4 = ceiling_pts[(i + 1) % len(floor_pts)], ceiling_pts[i]
+                    all_faces.append(([p1, p2, p3, p4], color))
 
-            # Update the render_height_map for the next shape in this pass
-            new_top_z = base_z + thickness
-            for gx in range(p_min_x_g, p_max_x_g + 1):
-                for gy in range(p_min_y_g, p_max_y_g + 1):
-                    if path.contains_point(((gx + 0.5) * grid_step, (gy + 0.5) * grid_step)):
-                        render_height_map[(gx, gy)] = new_top_z
+                new_top_z = base_z + thickness
+                for gx in range(p_min_x_g, p_max_x_g + 1):
+                    for gy in range(p_min_y_g, p_max_y_g + 1):
+                        if path.contains_point(((gx + 0.5) * grid_step, (gy + 0.5) * grid_step)):
+                            render_height_map[(gx, gy)] = new_top_z
 
-        # Add translucent bounding box using the final height map
         design_width = max_x - min_x
         design_height = max_y - min_y
         total_h = max(height_map.values()) if height_map else 0
         if total_h > 0:
             v = [(-design_width/2,-design_height/2,0), (design_width/2,-design_height/2,0), (design_width/2,design_height/2,0), (-design_width/2,design_height/2,0),
-                (-design_width/2,-design_height/2,total_h), (design_width/2,-design_height/2,total_h), (design_width/2,design_height/2,total_h), (-design_width/2,design_height/2,total_h)]
+                 (-design_width/2,-design_height/2,total_h), (design_width/2,-design_height/2,total_h), (design_width/2,design_height/2,total_h), (-design_width/2,design_height/2,total_h)]
             box_faces = [(0,1,2,3), (4,5,6,7), (0,3,7,4), (1,2,6,5), (0,1,5,4), (2,3,7,6)]
             for face in box_faces: all_faces.append(([v[i] for i in face], QColor(150,150,150,40)))
 
-        # Final sorting and drawing
         rad_y, rad_x = math.radians(self.angle_y), math.radians(self.angle_x)
         cos_y, sin_y, cos_x, sin_x = math.cos(rad_y), math.sin(rad_y), math.cos(rad_x), math.sin(rad_x)
         def get_viewspace_z(p):
@@ -557,8 +599,8 @@ class ThreeDViewDialog(QDialog):
         all_faces.sort(key=lambda face: sum(get_viewspace_z(p) for p in face[0]) / len(face[0]))
 
         z_offset = -total_h / 2.0
-        for points_3d, col in all_faces:
-            points_offset = [(p[0], p[1], p[2] + z_offset) for p in points_3d]
+        for points_2_5d, col in all_faces:
+            points_offset = [(p[0], p[1], p[2] + z_offset) for p in points_2_5d]
             points_2d = [self.project_point(*p) for p in points_offset]
             self.scene.addPolygon(QPolygonF(points_2d), QPen(col.darker(110), 0), QBrush(col))
 
@@ -570,12 +612,13 @@ class ThreeDViewDialog(QDialog):
             self.scene.addLine(QLineF(origin_proj, end), QPen(QColor(color_str), 0))
             label = self.scene.addText(name); label.setDefaultTextColor(QColor(color_str)); label.setPos(end)
             label.setFlag(QGraphicsItem.ItemIgnoresTransformations)
-        
+
         if fit_view:
             bounds = self.scene.itemsBoundingRect()
             if bounds.isValid():
-                margin = bounds.width() * 0.05
+                margin = max(10, bounds.width() * 0.05) # Ensure some margin even if width is 0
                 self.view.fitInView(bounds.adjusted(-margin, -margin, margin, margin), Qt.KeepAspectRatio)
+
 
 # -------------------------- Graphics items --------------------------
 
@@ -584,8 +627,13 @@ class SceneItemMixin:
     def customMousePressEvent(self, event): pass
     def customMouseReleaseEvent(self, event):
         if event.button() == Qt.LeftButton and self.flags() & QGraphicsItem.ItemIsMovable:
-            if event.scenePos() != event.buttonDownScenePos(Qt.LeftButton):
-                self.scene().views()[0].parent_win.update_data_from_item_move(self)
+             # Check if scene and view exist before accessing
+            if self.scene() and self.scene().views():
+                view = self.scene().views()[0]
+                # Compare scene positions
+                if event.scenePos() != event.buttonDownScenePos(Qt.LeftButton):
+                    view.parent_win.update_data_from_item_move(self)
+
 
 class RectItem(QGraphicsRectItem, SceneItemMixin):
     def __init__(self, rect, layer, data_obj, selectable=True):
@@ -601,9 +649,16 @@ class RectItem(QGraphicsRectItem, SceneItemMixin):
     def mouseReleaseEvent(self, event): super().mouseReleaseEvent(event); self.customMouseReleaseEvent(event)
 
     def refresh_appearance(self, selected=False):
+        # UPDATED to handle fill_pattern
         color = self.base_color.lighter(130) if selected else self.base_color
         color.setAlpha(180)
-        self.setBrush(QBrush(color))
+        brush = QBrush(color)
+        pattern = getattr(self.layer, 'fill_pattern', 'solid')
+        if pattern == 'hatch': brush.setStyle(Qt.BDiagPattern)
+        elif pattern == 'cross': brush.setStyle(Qt.CrossPattern)
+        elif pattern == 'dots': brush.setStyle(Qt.Dense7Pattern)
+        else: brush.setStyle(Qt.SolidPattern)
+        self.setBrush(brush)
         self.setPen(QPen(Qt.black, 0))
 
     def itemChange(self, change, value):
@@ -613,7 +668,9 @@ class RectItem(QGraphicsRectItem, SceneItemMixin):
     def mouseDoubleClickEvent(self, event):
         if event is None: event = QGraphicsSceneMouseEvent()
         super().mouseDoubleClickEvent(event)
-        self.scene().views()[0].parent_win.show_properties_dialog_for_item(self)
+        if self.scene() and self.scene().views(): # Check scene and views exist
+            self.scene().views()[0].parent_win.show_properties_dialog_for_item(self)
+
 
 class PolyItem(QGraphicsPolygonItem, SceneItemMixin):
     def __init__(self, poly, layer, data_obj, selectable=True):
@@ -629,9 +686,16 @@ class PolyItem(QGraphicsPolygonItem, SceneItemMixin):
     def mouseReleaseEvent(self, event): super().mouseReleaseEvent(event); self.customMouseReleaseEvent(event)
 
     def refresh_appearance(self, selected=False):
+        # UPDATED to handle fill_pattern
         color = self.base_color.lighter(130) if selected else self.base_color
         color.setAlpha(180)
-        self.setBrush(QBrush(color))
+        brush = QBrush(color)
+        pattern = getattr(self.layer, 'fill_pattern', 'solid')
+        if pattern == 'hatch': brush.setStyle(Qt.BDiagPattern)
+        elif pattern == 'cross': brush.setStyle(Qt.CrossPattern)
+        elif pattern == 'dots': brush.setStyle(Qt.Dense7Pattern)
+        else: brush.setStyle(Qt.SolidPattern)
+        self.setBrush(brush)
         self.setPen(QPen(Qt.black, 0))
 
     def itemChange(self, change, value):
@@ -641,74 +705,115 @@ class PolyItem(QGraphicsPolygonItem, SceneItemMixin):
     def mouseDoubleClickEvent(self, event):
         if event is None: event = QGraphicsSceneMouseEvent()
         super().mouseDoubleClickEvent(event)
-        self.scene().views()[0].parent_win.show_properties_dialog_for_item(self)
+        if self.scene() and self.scene().views(): # Check scene and views exist
+            self.scene().views()[0].parent_win.show_properties_dialog_for_item(self)
+
+# -------------------------- Process Dialog (Add this before MainWindow) --------------------------
 
 class ProcessDialog(QDialog):
     def __init__(self, project, parent=None):
         super().__init__(parent)
-        self.setWindowTitle("Simulate Process Step")
+        self.setWindowTitle("Add Process Step")
         self.project = project
-        layout = QGridLayout(self)
+        self.setMinimumWidth(400)
 
-        layout.addWidget(QLabel("Process Step:"), 0, 0)
-        self.step_combo = QComboBox()
-        self.step_combo.addItems(["Deposition", "Etching", "Doping"])
-        layout.addWidget(self.step_combo, 0, 1)
+        layout = QVBoxLayout(self)
+        form_layout = QGridLayout()
 
-        self.mask_layer_label = QLabel("Mask/Target Layer:")
-        layout.addWidget(self.mask_layer_label, 1, 0)
-        self.layer_combo = QComboBox()
-        self.layer_combo.addItems([l.name for l in self.project.layers])
-        layout.addWidget(self.layer_combo, 1, 1)
+        # Step Selection
+        self.combo_step = QComboBox()
+        self.combo_step.addItems(["Deposition", "Etch", "Doping", "Oxidation", "Lithography"])
+        self.combo_step.currentTextChanged.connect(self._update_ui_state)
+        
+        # Type Selection (Sub-types)
+        self.combo_type = QComboBox()
+        
+        # Layer Selection
+        self.combo_layer1 = QComboBox() # Primary Layer (Target or Mask)
+        self.combo_layer2 = QComboBox() # Secondary Layer (Substrate)
+        self.update_layer_lists()
 
-        # Add widgets for the substrate layer, initially hidden
-        self.substrate_label = QLabel("Substrate Layer (to Etch):")
-        layout.addWidget(self.substrate_label, 2, 0)
-        self.substrate_combo = QComboBox()
-        self.substrate_combo.addItems([l.name for l in self.project.layers])
-        layout.addWidget(self.substrate_combo, 2, 1)
-        self.substrate_label.hide()
-        self.substrate_combo.hide()
+        # Parameters
+        self.lbl_param1 = QLabel("Thickness (µm):")
+        self.spin_param1 = QDoubleSpinBox()
+        self.spin_param1.setRange(-1000, 1000); self.spin_param1.setValue(0.5)
+        
+        self.lbl_param2 = QLabel("Depth/Time:")
+        self.spin_param2 = QDoubleSpinBox()
+        self.spin_param2.setRange(0, 10000); self.spin_param2.setValue(1.0)
 
-        layout.addWidget(QLabel("Parameter (thickness, etc.):"), 3, 0)
-        self.param_spin = QDoubleSpinBox()
-        self.param_spin.setRange(-1000, 1000)
-        self.param_spin.setValue(10.0)
-        layout.addWidget(self.param_spin, 3, 1)
+        # Layout Assembly
+        row = 0
+        form_layout.addWidget(QLabel("Process Step:"), row, 0); form_layout.addWidget(self.combo_step, row, 1); row+=1
+        form_layout.addWidget(QLabel("Type/Method:"), row, 0); form_layout.addWidget(self.combo_type, row, 1); row+=1
+        
+        self.lbl_layer1 = QLabel("Target Layer:")
+        form_layout.addWidget(self.lbl_layer1, row, 0); form_layout.addWidget(self.combo_layer1, row, 1); row+=1
+        
+        self.lbl_layer2 = QLabel("Substrate Layer:")
+        form_layout.addWidget(self.lbl_layer2, row, 0); form_layout.addWidget(self.combo_layer2, row, 1); row+=1
+        
+        form_layout.addWidget(self.lbl_param1, row, 0); form_layout.addWidget(self.spin_param1, row, 1); row+=1
+        form_layout.addWidget(self.lbl_param2, row, 0); form_layout.addWidget(self.spin_param2, row, 1); row+=1
+
+        layout.addLayout(form_layout)
 
         buttons = QDialogButtonBox(QDialogButtonBox.Ok | QDialogButtonBox.Cancel)
         buttons.accepted.connect(self.accept)
         buttons.rejected.connect(self.reject)
-        layout.addWidget(buttons, 4, 0, 1, 2)
-        
-        # Connect signal to show/hide substrate widgets
-        self.step_combo.currentTextChanged.connect(self.on_step_changed)
-        self.on_step_changed(self.step_combo.currentText()) # Initial setup
+        layout.addWidget(buttons)
 
-    def on_step_changed(self, step):
-        is_etching = (step == "Etching")
-        self.substrate_label.setVisible(is_etching)
-        self.substrate_combo.setVisible(is_etching)
-        if is_etching:
-            self.mask_layer_label.setText("Mask Layer:")
-        else:
-            self.mask_layer_label.setText("Target Layer:")
+        self._update_ui_state(self.combo_step.currentText())
+
+    def update_layer_lists(self):
+        layer_names = [l.name for l in self.project.layers]
+        self.combo_layer1.clear(); self.combo_layer1.addItems(layer_names)
+        self.combo_layer2.clear(); self.combo_layer2.addItems(layer_names)
+
+    def _update_ui_state(self, step_name):
+        self.combo_type.clear()
+        
+        # Defaults
+        self.lbl_layer2.setVisible(False); self.combo_layer2.setVisible(False)
+        self.lbl_param2.setVisible(False); self.spin_param2.setVisible(False)
+        self.lbl_param1.setVisible(True); self.spin_param1.setVisible(True)
+
+        if step_name == "Deposition":
+            self.combo_type.addItems(["PVD", "CVD", "Spin-on", "Electroplating"])
+            self.lbl_layer1.setText("Target Layer:")
+            self.lbl_param1.setText("Thickness:")
+
+        elif step_name == "Etch":
+            self.combo_type.addItems(["Wet Etch", "RIE (Dry)", "DRIE", "Ion Milling"])
+            self.lbl_layer1.setText("Mask Layer:")
+            self.lbl_layer2.setVisible(True); self.lbl_layer2.setText("Substrate (to be etched):")
+            self.combo_layer2.setVisible(True)
+            self.lbl_param1.setVisible(False); self.spin_param1.setVisible(False) # Etch usually defined by depth
+            self.lbl_param2.setVisible(True); self.lbl_param2.setText("Etch Depth:")
+            self.spin_param2.setVisible(True)
+
+        elif step_name == "Doping":
+            self.combo_type.addItems(["Ion Implantation", "Diffusion"])
+            self.lbl_layer1.setText("Mask Layer:")
+            self.lbl_param1.setText("Dose (cm⁻²):")
+            self.spin_param1.setRange(1e10, 1e16); self.spin_param1.setValue(1e13)
+            self.lbl_param2.setVisible(True); self.lbl_param2.setText("Energy (keV):")
+            self.spin_param2.setVisible(True); self.spin_param2.setValue(50)
+
+        elif step_name == "Oxidation":
+            self.combo_type.addItems(["Dry", "Wet"])
+            self.lbl_layer1.setText("Substrate:")
+            self.lbl_param1.setText("Target Thickness:")
 
     def get_values(self):
-        step = self.step_combo.currentText()
-        if step == "Etching":
-            return {
-                "step": step,
-                "mask_layer": self.layer_combo.currentText(),
-                "substrate_layer": self.substrate_combo.currentText(),
-                "parameter": self.param_spin.value()
-            }
-        else:
-            return {
-                "step": step,
-                "layer": self.layer_combo.currentText(),
-                "parameter": self.param_spin.value()
-            }
+        return {
+            "step": self.combo_step.currentText(),
+            "type": self.combo_type.currentText(),
+            "layer1": self.combo_layer1.currentText(),
+            "layer2": self.combo_layer2.currentText() if self.combo_layer2.isVisible() else None,
+            "param1": self.spin_param1.value() if self.spin_param1.isVisible() else None,
+            "param2": self.spin_param2.value() if self.spin_param2.isVisible() else None
+        }
 
 class CircleItem(QGraphicsEllipseItem, SceneItemMixin):
     def __init__(self, rect, layer, data_obj, selectable=True):
@@ -724,9 +829,16 @@ class CircleItem(QGraphicsEllipseItem, SceneItemMixin):
     def mouseReleaseEvent(self, event): super().mouseReleaseEvent(event); self.customMouseReleaseEvent(event)
 
     def refresh_appearance(self, selected=False):
+        # UPDATED to handle fill_pattern
         color = self.base_color.lighter(130) if selected else self.base_color
         color.setAlpha(180)
-        self.setBrush(QBrush(color))
+        brush = QBrush(color)
+        pattern = getattr(self.layer, 'fill_pattern', 'solid')
+        if pattern == 'hatch': brush.setStyle(Qt.BDiagPattern)
+        elif pattern == 'cross': brush.setStyle(Qt.CrossPattern)
+        elif pattern == 'dots': brush.setStyle(Qt.Dense7Pattern)
+        else: brush.setStyle(Qt.SolidPattern)
+        self.setBrush(brush)
         self.setPen(QPen(Qt.black, 0))
 
     def itemChange(self, change, value):
@@ -736,7 +848,9 @@ class CircleItem(QGraphicsEllipseItem, SceneItemMixin):
     def mouseDoubleClickEvent(self, event):
         if event is None: event = QGraphicsSceneMouseEvent()
         super().mouseDoubleClickEvent(event)
-        self.scene().views()[0].parent_win.show_properties_dialog_for_item(self)
+        if self.scene() and self.scene().views(): # Check scene and views exist
+            self.scene().views()[0].parent_win.show_properties_dialog_for_item(self)
+
 
 class RefItem(QGraphicsItem):
     def __init__(self, ref, cell, project, selectable=True):
@@ -750,7 +864,12 @@ class RefItem(QGraphicsItem):
         self._draw_children()
 
     def _draw_children(self):
-        for item in self.childItems(): item.setParentItem(None)
+        # Clear existing children first
+        for item in self.childItems():
+            item.setParentItem(None)
+            # Optionally delete them if they are managed only here
+            # item.deleteLater() # Be careful with ownership
+
         for p_data in self.cell.polygons:
             if (layer := self.project.layer_by_name.get(p_data.layer)) and layer.visible:
                 PolyItem(QPolygonF([QPointF(*pt) for pt in p_data.points]), layer, p_data, False).setParentItem(self)
@@ -759,21 +878,30 @@ class RefItem(QGraphicsItem):
                 CircleItem(QRectF(*e_data.rect), layer, e_data, False).setParentItem(self)
         for r_data in self.cell.references:
             if r_data.cell in self.project.cells:
-                RefItem(r_data, self.project.cells[r_data.cell], self.project, selectable=False).setParentItem(self)
+                # Prevent infinite recursion if a cell references itself directly or indirectly
+                # Basic check: avoid direct self-reference rendering inside itself
+                if r_data.cell != self.project.cells[self.ref.cell]: # Check if the referenced cell is the same as the parent Ref's cell
+                    RefItem(r_data, self.project.cells[r_data.cell], self.project, selectable=False).setParentItem(self)
+                else:
+                    print(f"Warning: Skipped rendering self-reference of cell '{r_data.cell}' inside itself.")
+
 
     def mousePressEvent(self, event): super().mousePressEvent(event); self._drag_start_pos = self.pos()
     def mouseReleaseEvent(self, event):
         super().mouseReleaseEvent(event)
         if event.button() == Qt.LeftButton and self.flags() & QGraphicsItem.ItemIsMovable and self.pos() != self._drag_start_pos:
-            self.scene().views()[0].parent_win.update_data_from_item_move(self)
+             # Check scene and view exist
+            if self.scene() and self.scene().views():
+                 self.scene().views()[0].parent_win.update_data_from_item_move(self)
+
 
     def itemChange(self, change, value):
-        if change == QGraphicsItem.ItemPositionChange and self.scene():
+        if change == QGraphicsItem.ItemPositionChange and self.scene() and self.scene().views():
             if self.scene().views()[0].parent_win.chk_snap.isChecked():
                 return self.scene().views()[0].snap_point(value)
         return super().itemChange(change, value)
 
-    def boundingRect(self): return self.childrenBoundingRect() or QRectF(-5, -5, 10, 10)
+    def boundingRect(self): return self.childrenBoundingRect() or QRectF(-5, -5, 10, 10) # Fallback needed
     def paint(self, painter, option, widget):
         if self.isSelected():
             painter.setPen(QPen(Qt.darkCyan, 0, Qt.DashLine))
@@ -787,14 +915,10 @@ class CellListWidget(QListWidget):
         item = self.currentItem()
         if item:
             mimeData = QMimeData()
-            # Package the cell name as plain text
-            mimeData.setText(item.text())
-            
+            mimeData.setText(item.text()) # Package the cell name as plain text
             drag = QDrag(self)
             drag.setMimeData(mimeData)
-            
-            # Start the drag using the allowed actions
-            drag.exec_(Qt.CopyAction | Qt.LinkAction)
+            drag.exec_(Qt.CopyAction | Qt.LinkAction) # Start the drag
 
 # -------------------------- View/Scene with Rulers --------------------------
 
@@ -806,45 +930,51 @@ class Ruler(QWidget):
         self.setFixedHeight(30) if orientation == Qt.Horizontal else self.setFixedWidth(30)
 
     def paintEvent(self, event):
-        if not self.canvas.parent_win.project: return
+        if not hasattr(self.canvas, 'parent_win') or not self.canvas.parent_win.project: return # Added check
         painter = QPainter(self); painter.setFont(self.ruler_font)
         bg, tick = self.palette().color(QPalette.Window), self.palette().color(QPalette.WindowText)
         painter.fillRect(self.rect(), bg)
-        visible = self.canvas.mapToScene(self.canvas.viewport().rect()).boundingRect()
-        zoom = self.canvas.transform().m11()
+        try: # Add try-except for robustness if scene/view not fully ready
+            visible = self.canvas.mapToScene(self.canvas.viewport().rect()).boundingRect()
+            zoom = self.canvas.transform().m11()
+        except Exception:
+            return
         pitch = float(self.canvas.parent_win.project.grid_pitch)
         if pitch <= 0: return
         req_pitch = 8
-        while (pitch * zoom) < req_pitch: pitch *= 5
-        while (pitch * zoom) > req_pitch * 5: pitch /= 5
+        draw_pitch = pitch # Start with actual grid pitch
+        while (draw_pitch * zoom) < req_pitch: draw_pitch *= 5 # Increase drawn pitch if too dense
+        while (draw_pitch * zoom) > req_pitch * 5: draw_pitch /= 5 # Decrease drawn pitch if too sparse
         painter.setPen(QPen(tick, 1))
+
         if self.orientation == Qt.Horizontal:
-            start = math.floor(visible.left() / pitch) * pitch
-            end = math.ceil(visible.right() / pitch) * pitch
-            count = int(round(start / pitch))
+            start = math.floor(visible.left() / draw_pitch) * draw_pitch
+            end = math.ceil(visible.right() / draw_pitch) * draw_pitch
             x = start
             while x <= end:
                 vx = self.canvas.mapFromScene(QPointF(x, 0)).x()
-                h = 10 if count % 5 == 0 else 5
+                is_major = abs(x % (pitch * 5)) < (draw_pitch * 0.1) # Check if it's a multiple of 5*pitch
+                h = 10 if is_major else 5
                 painter.drawLine(vx, self.height(), vx, self.height() - h)
-                if count % 5 == 0 and zoom > 0.05:
+                if is_major and zoom * (pitch * 5) > 40: # Only draw text if spaced enough
                     painter.drawText(vx + 2, self.height() - 12, f"{x:.0f}")
-                x += pitch; count += 1
-        else:
-            start = math.floor(visible.top() / pitch) * pitch
-            end = math.ceil(visible.bottom() / pitch) * pitch
-            count = int(round(start / pitch))
+                x += draw_pitch
+
+        else: # Vertical
+            start = math.floor(visible.top() / draw_pitch) * draw_pitch
+            end = math.ceil(visible.bottom() / draw_pitch) * draw_pitch
             y = start
             while y <= end:
                 vy = self.canvas.mapFromScene(QPointF(0, y)).y()
-                w = 10 if count % 5 == 0 else 5
+                is_major = abs(y % (pitch * 5)) < (draw_pitch * 0.1) # Check if it's a multiple of 5*pitch
+                w = 10 if is_major else 5
                 painter.drawLine(self.width(), vy, self.width() - w, vy)
-                if count % 5 == 0 and zoom > 0.05:
+                if is_major and zoom * (pitch * 5) > 40: # Only draw text if spaced enough
                     painter.save()
                     painter.translate(self.width() - 12, vy - 2); painter.rotate(90)
-                    painter.drawText(0, 0, f"{-y:.0f}")
+                    painter.drawText(0, 0, f"{-y:.0f}") # Display negative Y upwards
                     painter.restore()
-                y += pitch; count += 1
+                y += draw_pitch
 
 class CanvasContainer(QWidget):
     def __init__(self, canvas, parent=None):
@@ -853,9 +983,10 @@ class CanvasContainer(QWidget):
         self.h_ruler, self.v_ruler = Ruler(Qt.Horizontal, self.canvas), Ruler(Qt.Vertical, self.canvas)
         layout = QGridLayout(); layout.setSpacing(0); layout.setContentsMargins(0,0,0,0)
         corner = QWidget(); corner.setFixedSize(30, 30); corner.setStyleSheet("background-color: palette(window);")
-        layout.addWidget(self.h_ruler, 0, 1); layout.addWidget(self.v_ruler, 1, 0)
-        layout.addWidget(self.canvas, 1, 1); layout.addWidget(corner, 0, 0)
+        layout.addWidget(corner, 0, 0); layout.addWidget(self.h_ruler, 0, 1)
+        layout.addWidget(self.v_ruler, 1, 0); layout.addWidget(self.canvas, 1, 1)
         self.setLayout(layout)
+        # Connect signals
         self.canvas.horizontalScrollBar().valueChanged.connect(self.h_ruler.update)
         self.canvas.verticalScrollBar().valueChanged.connect(self.v_ruler.update)
         self.canvas.zoomChanged.connect(self.h_ruler.update)
@@ -870,13 +1001,14 @@ class Canvas(QGraphicsView):
         self.setRenderHints(QPainter.Antialiasing); self.setAcceptDrops(True)
         self.setTransformationAnchor(QGraphicsView.AnchorUnderMouse); self.setResizeAnchor(QGraphicsView.AnchorViewCenter)
         self.setViewport(QOpenGLWidget())
-        #self.setViewportUpdateMode(QGraphicsView.FullViewportUpdate)
         self.mode = self.MODES["select"]; self.start_pos = None; self.temp_item = None
         self.temp_poly_points: List[QPointF] = []
         self.temp_path_points: List[QPointF] = []
         self.get_active_layer, self.parent_win = get_active_layer, parent
         self.setDragMode(QGraphicsView.RubberBandDrag)
         self._panning = False
+        self._pan_start = QPointF()
+
 
     def drawBackground(self, painter: QPainter, rect: QRectF):
         super().drawBackground(painter, rect)
@@ -888,23 +1020,31 @@ class Canvas(QGraphicsView):
         painter.fillRect(rect, bg)
         pitch = float(self.parent_win.project.grid_pitch)
         if pitch <= 0: return
-        req_pitch = 8
-        while (pitch * zoom) < req_pitch: pitch *= 5
-        while (pitch * zoom) > req_pitch * 5: pitch /= 5
+        req_pitch = 8 # Min pixels between grid lines
+        draw_pitch = pitch
+        while (draw_pitch * zoom) < req_pitch: draw_pitch *= 5
+        while (draw_pitch * zoom) > req_pitch * 5: draw_pitch /= 5
         minor_pen, major_pen = QPen(minor_c, 0), QPen(major_c, 0)
-        left, right, top, bottom = visible.left(), visible.right(), visible.top(), visible.bottom()
-        x_start, x_end = math.floor(left / pitch) * pitch, math.ceil(right / pitch) * pitch
-        count = int(round(x_start / pitch)); x = x_start
+        left, right = visible.left(), visible.right()
+        top, bottom = visible.top(), visible.bottom()
+
+        x_start = math.floor(left / draw_pitch) * draw_pitch
+        x_end = math.ceil(right / draw_pitch) * draw_pitch
+        x = x_start
         while x <= x_end:
-            painter.setPen(major_pen if count % 5 == 0 else minor_pen)
+            is_major = abs(x % (pitch * 5)) < (draw_pitch * 0.1) if pitch > 0 else (x==0)
+            painter.setPen(major_pen if is_major else minor_pen)
             painter.drawLine(QPointF(x, top), QPointF(x, bottom))
-            x += pitch; count += 1
-        y_start, y_end = math.floor(top / pitch) * pitch, math.ceil(bottom / pitch) * pitch
-        count = int(round(y_start / pitch)); y = y_start
+            x += draw_pitch
+
+        y_start = math.floor(top / draw_pitch) * draw_pitch
+        y_end = math.ceil(bottom / draw_pitch) * draw_pitch
+        y = y_start
         while y <= y_end:
-            painter.setPen(major_pen if count % 5 == 0 else minor_pen)
+            is_major = abs(y % (pitch * 5)) < (draw_pitch * 0.1) if pitch > 0 else (y==0)
+            painter.setPen(major_pen if is_major else minor_pen)
             painter.drawLine(QPointF(left, y), QPointF(right, y))
-            y += pitch; count += 1
+            y += draw_pitch
 
     def wheelEvent(self, event):
         factor = 1.15 if event.angleDelta().y() > 0 else 1 / 1.15
@@ -950,87 +1090,97 @@ class Canvas(QGraphicsView):
             elif self.mode == self.MODES["poly"]:
                 self.temp_poly_points.append(scene_pos)
                 if self.temp_item: self.scene().removeItem(self.temp_item)
-
                 if len(self.temp_poly_points) > 1:
                     poly = QPolygonF(self.temp_poly_points)
                     self.temp_item = self.scene().addPolygon(poly, QPen(Qt.gray, 0, Qt.DashLine))
-                elif self.temp_poly_points:
-                    marker_size = 2
-                    marker_rect = QRectF(scene_pos.x() - marker_size / 2, scene_pos.y() - marker_size / 2, marker_size, marker_size)
-                    self.temp_item = self.scene().addRect(marker_rect, QPen(Qt.gray, 0))
+                elif self.temp_poly_points: # Show first point marker
+                    marker_size = max(2, self.parent_win.project.grid_pitch / 10 * self.transform().m11()) # Scale marker size slightly
+                    marker_rect = QRectF(scene_pos - QPointF(marker_size/2, marker_size/2), QSizeF(marker_size, marker_size))
+                    self.temp_item = self.scene().addRect(marker_rect, QPen(Qt.gray, 0), QBrush(Qt.gray))
+
             elif self.mode == self.MODES["path"]:
                 self.temp_path_points.append(scene_pos)
                 if self.temp_item: self.scene().removeItem(self.temp_item)
                 if len(self.temp_path_points) > 1:
                     poly = QPolygonF(self.temp_path_points)
-                    path = QPainterPath(); path.addPolygon(poly)
+                    path = QPainterPath(); path.moveTo(poly[0])
+                    for p in poly[1:]: path.lineTo(p) # Create open path
                     self.temp_item = self.scene().addPath(path, QPen(Qt.gray, 0, Qt.DashLine))
+                elif self.temp_path_points: # Show first point marker
+                    marker_size = max(2, self.parent_win.project.grid_pitch / 10 * self.transform().m11())
+                    marker_rect = QRectF(scene_pos - QPointF(marker_size/2, marker_size/2), QSizeF(marker_size, marker_size))
+                    self.temp_item = self.scene().addRect(marker_rect, QPen(Qt.gray, 0), QBrush(Qt.gray))
             else:
-                super().mousePressEvent(event)
+                super().mousePressEvent(event) # Pass to base class for selection/move
                 return
             event.accept()
         else:
-            super().mousePressEvent(event)
+            super().mousePressEvent(event) # Handle other buttons (e.g., right-click context menu)
+
 
     def contextMenuEvent(self, event):
         item = self.itemAt(event.pos())
         menu = QMenu(self)
-        
+
         paste_action = menu.addAction("Paste")
         paste_action.triggered.connect(lambda: self.parent_win.paste_shapes(self.mapToScene(event.pos())))
         if not self.parent_win.can_paste(): paste_action.setEnabled(False)
-        
+
         if isinstance(item, (RectItem, PolyItem, CircleItem, RefItem)):
             if not item.isSelected():
-                self.scene().clearSelection()
-                item.setSelected(True)
-            
+                # Allow selecting multiple items before right-clicking
+                # Only clear if the clicked item wasn't already part of the selection
+                if not item in self.scene().selectedItems():
+                    self.scene().clearSelection()
+                    item.setSelected(True)
+
+
             menu.addSeparator()
             prop = menu.addAction("Properties..."); prop.triggered.connect(lambda: self.parent_win.show_properties_dialog_for_item(item))
             rename = menu.addAction("Rename..."); rename.triggered.connect(self.parent_win.rename_selected_shape)
             measure = menu.addAction("Measure..."); measure.triggered.connect(self.parent_win.measure_selection)
-            
+
             menu.addSeparator()
             copy = menu.addAction("Copy"); copy.triggered.connect(self.parent_win.copy_selected_shapes)
-            
-            # Arrange Submenu
-            arrange_menu = menu.addMenu("Arrange")
-            front = arrange_menu.addAction("Bring to Front")
-            front.triggered.connect(self.parent_win.bring_selection_to_front)
-            forward = arrange_menu.addAction("Move Forward")
-            forward.triggered.connect(self.parent_win.move_selection_forward)
-            backward = arrange_menu.addAction("Move Backward")
-            backward.triggered.connect(self.parent_win.move_selection_backward)
-            back = arrange_menu.addAction("Send to Back")
-            back.triggered.connect(self.parent_win.send_selection_to_back)
 
-            # Transform Submenu
+            arrange_menu = menu.addMenu("Arrange")
+            front = arrange_menu.addAction("Bring to Front"); front.triggered.connect(self.parent_win.bring_selection_to_front)
+            forward = arrange_menu.addAction("Move Forward"); forward.triggered.connect(self.parent_win.move_selection_forward)
+            backward = arrange_menu.addAction("Move Backward"); backward.triggered.connect(self.parent_win.move_selection_backward)
+            back = arrange_menu.addAction("Send to Back"); back.triggered.connect(self.parent_win.send_selection_to_back)
+
             transform_menu = menu.addMenu("Transform")
             rot = transform_menu.addAction("Rotate..."); rot.triggered.connect(self.parent_win.rotate_selection)
             sca = transform_menu.addAction("Scale..."); sca.triggered.connect(self.parent_win.scale_selection)
             flip_menu = transform_menu.addMenu("Flip")
             fh = flip_menu.addAction("Horizontal"); fh.triggered.connect(self.parent_win.flip_selection_horizontal)
             fv = flip_menu.addAction("Vertical"); fv.triggered.connect(self.parent_win.flip_selection_vertical)
-            
-            # Move to Layer Submenu
+
             move_menu = menu.addMenu("Move to Layer")
             for layer in self.parent_win.project.layers:
                 layer_action = move_menu.addAction(layer.name)
-                layer_action.triggered.connect(lambda checked=False, l=layer.name: self.parent_win.move_selection_to_layer(l))
-            
+                # Use lambda capture to get the correct layer name
+                layer_action.triggered.connect(lambda checked=False, l_name=layer.name: self.parent_win.move_selection_to_layer(l_name))
+
+
             menu.addSeparator()
             delete = menu.addAction("Delete"); delete.triggered.connect(self.parent_win.delete_selected_items)
-            
+
         menu.exec_(event.globalPos())
 
     def mouseMoveEvent(self, event):
         scene_pos = self.mapToScene(event.pos())
-        self.parent_win.statusBar().showMessage(f"X: {scene_pos.x():.2f}, Y: {-scene_pos.y():.2f}")
+        # Always update status bar, even if panning
+        self.parent_win.statusBar().showMessage(f"X: {scene_pos.x():.2f}, Y: {-scene_pos.y():.2f}") # Y is inverted
+
         if self._panning:
-            delta = self._pan_start - event.pos(); self._pan_start = event.pos()
-            self.horizontalScrollBar().setValue(self.horizontalScrollBar().value() + delta.x())
-            self.verticalScrollBar().setValue(self.verticalScrollBar().value() + delta.y())
+            delta = event.pos() - self._pan_start ; self._pan_start = event.pos()
+            # Use scrollbars for panning
+            self.horizontalScrollBar().setValue(self.horizontalScrollBar().value() - delta.x())
+            self.verticalScrollBar().setValue(self.verticalScrollBar().value() - delta.y())
             event.accept(); return
+
+        # Drawing Temp Items
         if self.temp_item and self.start_pos:
             snapped_pos = self.snap_point(scene_pos)
             if self.mode in [self.MODES["rect"], self.MODES["circle"]]:
@@ -1038,35 +1188,42 @@ class Canvas(QGraphicsView):
             elif self.mode == self.MODES["measure"]:
                 line = QLineF(self.start_pos, snapped_pos)
                 self.temp_item.setLine(line)
+                # Update status bar with measure info
                 self.parent_win.statusBar().showMessage(f"dX: {line.dx():.2f}, dY: {-line.dy():.2f}, Dist: {line.length():.2f}")
             event.accept(); return
         elif self.mode == self.MODES["poly"] and len(self.temp_poly_points) > 0:
-            if self.temp_item: self.scene().removeItem(self.temp_item)
-            poly_pts = self.temp_poly_points + [self.snap_point(scene_pos)]
+            if self.temp_item: self.scene().removeItem(self.temp_item) # Remove previous temp line/poly
+            poly_pts = self.temp_poly_points + [self.snap_point(scene_pos)] # Add current mouse pos
             poly = QPolygonF(poly_pts)
             self.temp_item = self.scene().addPolygon(poly, QPen(Qt.gray, 0, Qt.DashLine))
+            event.accept(); return
         elif self.mode == self.MODES["path"] and len(self.temp_path_points) > 0:
             if self.temp_item: self.scene().removeItem(self.temp_item)
             path_pts = self.temp_path_points + [self.snap_point(scene_pos)]
             poly = QPolygonF(path_pts)
-            path = QPainterPath(); path.addPolygon(poly)
+            path = QPainterPath(); path.moveTo(poly[0])
+            for p in poly[1:]: path.lineTo(p) # Create open path
             self.temp_item = self.scene().addPath(path, QPen(Qt.gray, 0, Qt.DashLine))
+            event.accept(); return
 
-        super().mouseMoveEvent(event)
+        super().mouseMoveEvent(event) # Pass to base class for selection rubber band / item moving
+
 
     def mouseReleaseEvent(self, event):
         if event.button() == Qt.MiddleButton and self._panning:
             self._panning = False; self.setCursor(Qt.ArrowCursor); event.accept(); return
         if self.start_pos and self.mode in [self.MODES["rect"], self.MODES["circle"]]:
             rect = self.temp_item.rect()
-            self.temp_cancel()
+            self.temp_cancel() # Remove temp item BEFORE adding permanent one
             if rect.width() > 0 and rect.height() > 0 and (layer := self.get_active_layer()):
                 if self.mode == self.MODES["rect"]: self.parent_win.add_rect_to_active_cell(rect, layer)
                 else: self.parent_win.add_circle_to_active_cell(rect, layer)
             event.accept(); return
         if self.start_pos and self.mode == self.MODES["measure"]:
-            self.temp_cancel(); event.accept(); return
-        super().mouseReleaseEvent(event)
+            self.temp_cancel(); event.accept(); return # Just remove the measurement line
+        # No special release action for poly/path needed here, happens on double-click or escape
+        super().mouseReleaseEvent(event) # Pass to base class
+
 
     def mouseDoubleClickEvent(self, event):
         if self.mode == self.MODES["path"] and event.button() == Qt.LeftButton:
@@ -1077,21 +1234,27 @@ class Canvas(QGraphicsView):
 
     def keyPressEvent(self, event):
         if event.key() == Qt.Key_Escape:
-            self.parent_win.set_active_tool("select")
-            self.temp_cancel()
-        else: 
+            self.parent_win.set_active_tool("select") # Also cancels temp items via set_mode
+        elif event.key() == Qt.Key_Return or event.key() == Qt.Key_Enter:
+             # Finish poly/path on Enter key
+             if self.mode == self.MODES["poly"]:
+                 self.finish_polygon()
+             elif self.mode == self.MODES["path"]:
+                 self.finish_path()
+        else:
             super().keyPressEvent(event)
+
 
     def finish_polygon(self):
         can_create = len(self.temp_poly_points) >= 3 and (layer := self.get_active_layer())
         if can_create: poly = QPolygonF(self.temp_poly_points)
-        self.temp_cancel()
+        self.temp_cancel() # Clear temp items
         if can_create: self.parent_win.add_poly_to_active_cell(poly, layer)
-    
+
     def finish_path(self):
         can_create = len(self.temp_path_points) >= 2 and (layer := self.get_active_layer())
         if can_create:
-            points = self.temp_path_points[:] # Make a copy
+            points = self.temp_path_points[:] # Make a copy before clearing
         else:
             points = []
         self.temp_cancel()
@@ -1107,21 +1270,187 @@ class Canvas(QGraphicsView):
             event.ignore(); return
         if cell_name == self.parent_win.active_cell_name:
             QToolTip.showText(event.globalPos(), "Cannot drop a cell onto itself."); event.ignore(); return
-        
+
         item_at_pos = self.itemAt(event.pos())
         target_data_obj = None
 
+        # Check if dropped onto a selectable shape item
         if isinstance(item_at_pos, (RectItem, PolyItem, CircleItem)) and \
            (item_at_pos.flags() & QGraphicsItem.ItemIsSelectable):
             target_data_obj = item_at_pos.data_obj
-                
+
         if target_data_obj:
             self.parent_win.instantiate_cell_on_shape(cell_name, target_data_obj)
         else:
             scene_pos = self.mapToScene(event.pos())
             self.parent_win.add_reference_to_active_cell(cell_name, self.snap_point(scene_pos))
-            
+
         event.acceptProposedAction()
+
+class ThreeDViewDialog(QDialog):
+    def __init__(self, project, parent=None):
+        super().__init__(parent)
+        self.setWindowTitle("High-Fidelity 3D View (Level Set / SDF)")
+        self.resize(1200, 900)
+        self.project = project
+        
+        # Grid Resolution (Lower = Smoother but slower)
+        self.res = 2.0 
+        
+        # Dimensions setup
+        self.w = int(self.project.canvas_width / self.res)
+        self.h = int(self.project.canvas_height / self.res)
+        self.d = 100 # Vertical resolution
+        
+        # The Volume Grid: Stores 'Material ID' for every point
+        self.volume = np.zeros((self.w, self.h, self.d), dtype=np.uint8)
+        
+        # Layout
+        layout = QVBoxLayout(self)
+        
+        # 3D Widget
+        if _has_3d_deps:
+            self.gl_view = gl.GLViewWidget()
+            self.gl_view.opts['distance'] = 200
+            self.gl_view.setBackgroundColor('#202020')
+            layout.addWidget(self.gl_view)
+        else:
+            layout.addWidget(QLabel("Error: Missing pyqtgraph/skimage/scipy"))
+
+        # Controls
+        ctrl = QHBoxLayout()
+        btn = QPushButton("Generate Realistic Model"); btn.clicked.connect(self.run_realistic_build)
+        ctrl.addWidget(btn)
+        layout.addLayout(ctrl)
+
+        # Colors (R, G, B, Alpha)
+        self.colors = [
+            (0,0,0,0),          # 0: Air
+            (0.6,0.6,0.6,1),    # 1: Silicon Substrate
+            (0.2,0.4,0.8,0.6),  # 2: Oxide (Blueish)
+            (0.8,0.2,0.2,0.6),  # 3: Metal (Redish)
+            (0.2,0.8,0.2,0.6),  # 4: Nitride (Greenish)
+            (0.9,0.9,0.2,0.7)   # 5: Photoresist (Yellow)
+        ]
+
+    def run_realistic_build(self):
+        """Simulates the process stack using Signed Distance Fields (SDF)."""
+        from scipy.ndimage import distance_transform_edt, gaussian_filter
+
+        print("Starting Simulation...")
+        self.volume[:] = 0
+        self.gl_view.clear()
+        
+        # 1. Initialize Substrate (Bottom 20% of Z-stack)
+        sub_h = int(self.d * 0.2)
+        self.volume[:, :, 0:sub_h] = 1 
+        current_z = sub_h
+
+        # 2. Process Layers
+        mat_id = 2
+        for layer in self.project.layers:
+            if not layer.visible: continue
+            
+            # --- A. Get 2D Mask ---
+            # Rasterize vector polygons to a 2D boolean grid
+            mask_2d = self.get_layer_mask(layer.name)
+            if not np.any(mask_2d): continue
+
+            # --- B. REALISM: Rounded Corners (Lithography smoothing) ---
+            # Apply Gaussian Blur to the boolean mask to round sharp corners
+            # before extruding. This simulates light diffraction limits.
+            mask_float = mask_2d.astype(float)
+            mask_blurred = gaussian_filter(mask_float, sigma=2.0) # sigma controls rounding
+            mask_processed = mask_blurred > 0.5 # Re-binarize
+
+            # --- C. REALISM: Tapered Walls ---
+            # Calculate Distance Transform (SDF) of the mask
+            # dt is the distance from any pixel to the nearest edge
+            dt = distance_transform_edt(mask_processed)
+            
+            # Layer settings
+            thickness = int(layer.thickness_2_5d / self.res)
+            taper_angle = 10.0 # Degrees (0 = Vertical, >0 = Pyramidal)
+            
+            # --- D. Volumetric Stacking ---
+            for z in range(thickness):
+                z_idx = current_z + z
+                if z_idx >= self.d: break
+                
+                # Calculate erosion based on height (Taper Math)
+                # Higher up in Z = more erosion (taper in)
+                erosion_amount = z * np.tan(np.radians(taper_angle))
+                
+                # Create the mask for this specific Z-slice
+                # Pixels are solid if they are "deep enough" inside the shape
+                # relative to how high up (Z) we are.
+                z_mask = dt > erosion_amount
+                
+                # Apply material to volume
+                # Only write where not already solid (simple deposition)
+                # or overwrite if needed.
+                self.volume[z_mask, z_idx] = mat_id
+
+            current_z += thickness
+            mat_id += 1
+
+        self.render_volume()
+
+    def render_volume(self):
+        """Uses Marching Cubes to render the Isosurfaces."""
+        if not _has_3d_deps:
+            print("Error: 3D dependencies missing.")
+            return
+
+        unique_mats = np.unique(self.volume)
+        
+        for mid in unique_mats:
+            if mid == 0: continue
+            
+            # Isolate material
+            mat_vol = (self.volume == mid).astype(float)
+            
+            # Smooth the VOLUME to blend layers
+            from scipy.ndimage import gaussian_filter
+            mat_vol = gaussian_filter(mat_vol, sigma=0.5) 
+            
+            try:
+                # Use the 'measure' module from skimage
+                verts, faces, _, _ = measure.marching_cubes(mat_vol, level=0.5)
+                
+                # Scale vertices back to real-world units
+                verts[:, 0] *= self.res # X
+                verts[:, 1] *= self.res # Y
+                
+                # Scale Z (approximate based on layer thickness)
+                # You might need to adjust this factor based on your exact Z-unit logic
+                verts[:, 2] *= 1.0 
+                
+                mesh = gl.GLMeshItem(vertexes=verts, faces=faces, 
+                                     color=self.colors[mid % len(self.colors)],
+                                     shader='shaded', smooth=True, 
+                                     glOptions='translucent')
+                self.gl_view.addItem(mesh)
+            except Exception as e:
+                print(f"Mesh generation failed for material {mid}: {e}")
+
+    def get_layer_mask(self, layer_name):
+        """Standard rasterization (same as before)."""
+        import matplotlib.path as mpath
+        cell = self.project.cells[self.project.top]
+        x = np.linspace(0, self.project.canvas_width, self.w)
+        y = np.linspace(0, self.project.canvas_height, self.h)
+        xv, yv = np.meshgrid(x, y)
+        points = np.vstack((xv.flatten(), yv.flatten())).T
+        
+        polys = [p.points for p in cell.polygons if p.layer == layer_name]
+        full_mask = np.zeros((self.w, self.h), dtype=bool)
+        
+        for p_points in polys:
+            path = mpath.Path(p_points)
+            mask = path.contains_points(points).reshape(self.h, self.w).T
+            full_mask |= mask
+        return full_mask
 
 # -------------------------- Main window --------------------------
 
@@ -1157,19 +1486,28 @@ class MainWindow(QMainWindow):
 
     def initialize_project(self, project):
         self.project = project
+        
+        # Ensure top cell exists, fallback if not
+        if not self.project.top or self.project.top not in self.project.cells:
+             if self.project.cells:
+                 self.project.top = list(self.project.cells.keys())[0]
+             else: # No cells exist at all, create a default TOP
+                 self.project.top = "TOP"
+                 self.project.cells["TOP"] = Cell()
+                 
         self.active_cell_name = self.project.top
         self.active_layer_name = self.project.layers[0].name if self.project.layers else None
         
-        # Use a boundless scene, this is still correct
-        self.scene = QGraphicsScene()
-
+        self.scene = QGraphicsScene() # Use a boundless scene
         self.view = Canvas(self.scene, self.active_layer, self)
-        self.view.scale(1, -1)
+        self.view.scale(1, -1) # Invert Y axis for typical layout coordinates
         self.canvas_container = CanvasContainer(self.view, self)
         self.setCentralWidget(self.canvas_container)
+        
         self.update_ui_from_project() # This calls _redraw_scene() which populates the scene
+        
         self._undo_stack, self._redo_stack = [], []
-        self._save_state()
+        self._save_state() # Initial state
         self._is_dirty = False
         self._update_window_title()
         self.fill_view()
@@ -1194,6 +1532,7 @@ class MainWindow(QMainWindow):
                 if not self.save_json(): event.ignore()
             elif reply == QMessageBox.Cancel:
                 event.ignore()
+            # If Discard, proceed to close (accept event)
 
     def _prompt_save_if_dirty(self):
         if not self._is_dirty: return True
@@ -1213,7 +1552,7 @@ class MainWindow(QMainWindow):
     def open_file(self, path=None):
         if not self._prompt_save_if_dirty(): return
         if not path:
-            filters = "Layout Files (*.json *.gds *.oas);;All Files (*)"
+            filters = "Layout Files (*.json *.gds *.oas);;JSON Project (*.json);;GDSII Files (*.gds);;OASIS Files (*.oas);;All Files (*)"
             path, _ = QFileDialog.getOpenFileName(self, "Open File", "", filters)
         if not path: return
         QApplication.setOverrideCursor(Qt.WaitCursor)
@@ -1231,18 +1570,37 @@ class MainWindow(QMainWindow):
 
     def _load_json(self, path):
         with open(path, "r") as f: data = json.load(f)
+        
+        # --- Make sure layer has new attributes ---
+        loaded_layers = []
+        for l_data in data.get('layers', []):
+            if 'fill_pattern' not in l_data: l_data['fill_pattern'] = 'solid'
+            if 'thickness_2_5d' not in l_data: l_data['thickness_2_5d'] = 10.0
+            loaded_layers.append(Layer(**l_data))
+
         project = Project(
             units=data.get('units', 'um'), top=data.get('top', 'TOP'),
-            layers=[Layer(**l) for l in data.get('layers', [])],
+            layers=loaded_layers, # Use the potentially updated list
             grid_pitch=data.get('grid_pitch', 50),
             canvas_width=data.get('canvas_width', 2000), canvas_height=data.get('canvas_height', 1500)
         )
         for name, c_data in data.get('cells', {}).items():
-            for p in c_data.get('polygons', []): p.pop('uuid', None)
-            for e in c_data.get('ellipses', []): e.pop('uuid', None)
-            project.cells[name] = Cell(polygons=[Poly(**p) for p in c_data.get('polygons', [])],
-                                       ellipses=[Ellipse(**e) for e in c_data.get('ellipses', [])],
-                                       references=[Ref(**r) for r in c_data.get('references', [])])
+            # Handle potential missing UUIDs on load more gracefully
+            polys = []
+            for p_dict in c_data.get('polygons', []):
+                p_dict.pop('uuid', None) # Always remove old uuid if present
+                polys.append(Poly(**p_dict))
+
+            ellipses = []
+            for e_dict in c_data.get('ellipses', []):
+                e_dict.pop('uuid', None)
+                ellipses.append(Ellipse(**e_dict))
+
+            refs = [Ref(**r) for r in c_data.get('references', [])]
+            # Load etch pairs if they exist
+            etch_pairs = [tuple(ep) for ep in c_data.get('etch_pairs', [])]
+            project.cells[name] = Cell(polygons=polys, ellipses=ellipses, references=refs, etch_pairs=etch_pairs)
+
         project.refresh_layer_map()
         self.current_file_path = path
         self.initialize_project(project)
@@ -1261,35 +1619,56 @@ class MainWindow(QMainWindow):
             except Exception as e: print(f"Warning: Could not read sidecar metadata file. {e}")
         
         project = self._create_default_project(50, 2000, 1500)
-        project.cells.clear()
+        project.cells.clear() # Start with fresh cells/layers from default
+        project.layers.clear() # Clear default layers
 
-        gds_layers = sorted({ld[0] for ld in lib.layers_and_datatypes()})
+        gds_layers = sorted(list(set(ld[0] for ld in lib.layers_and_datatypes()))) # Unique layer numbers
         layer_num_to_name = {}
-        existing_layer_names = {l.name for l in project.layers}
+        existing_layer_names = set()
 
         for l_num in gds_layers:
             layer_name = None
             if l_num in layer_meta:
                 meta = layer_meta[l_num]
-                layer_name = meta['name']
-                if layer_name not in existing_layer_names:
-                    project.layers.append(Layer(name=layer_name, color=tuple(meta['color']), visible=meta['visible']))
+                layer_name = meta.get('name')
+                if layer_name and layer_name not in existing_layer_names:
+                    project.layers.append(Layer(
+                        name=layer_name, 
+                        color=tuple(meta.get('color', (l_num*20%255, l_num*50%255, l_num*80%255))), 
+                        visible=meta.get('visible', True),
+                        fill_pattern=meta.get('fill_pattern', 'solid'),
+                        thickness_2_5d=meta.get('thickness_2_5d', 10.0)
+                        ))
                     existing_layer_names.add(layer_name)
-            else:
+            
+            if not layer_name or layer_name in existing_layer_names and l_num not in layer_num_to_name:
+                # If meta name was missing, or was a duplicate, create a default name
                 layer_name = f"Layer_{l_num}"
                 if layer_name not in existing_layer_names:
-                    project.layers.append(Layer(layer_name, (l_num*20%255, l_num*50%255, l_num*80%255)))
+                    project.layers.append(Layer(
+                        layer_name, 
+                        (l_num*20%255, l_num*50%255, l_num*80%255),
+                        fill_pattern='solid',
+                        thickness_2_5d=10.0
+                        ))
                     existing_layer_names.add(layer_name)
-            layer_num_to_name[l_num] = layer_name
+            
+            layer_num_to_name[l_num] = layer_name # Map GDS layer number to our name
+
 
         project.refresh_layer_map()
         
         for cell in lib.cells:
             new_cell = Cell()
-            # NO MORE MANUAL SCALING NEEDED HERE
             for poly in cell.polygons:
-                layer_name = layer_num_to_name.get(poly.layer, f"Layer_{poly.layer}")
-                new_cell.polygons.append(Poly(layer_name, poly.points.tolist()))
+                # Find the layer name matching the GDS layer number
+                layer_name = layer_num_to_name.get(poly.layer)
+                # If layer was defined, add the polygon
+                if layer_name and layer_name in project.layer_by_name:
+                    new_cell.polygons.append(Poly(layer_name, poly.points.tolist()))
+                # Optional: Handle datatypes if needed, e.g., f"Layer_{poly.layer}_{poly.datatype}"
+                # else:
+                #    print(f"Warning: Skipping polygon on unmapped GDS layer {poly.layer}")
 
             for ref in cell.references:
                 ref_cell_name = ref.cell.name if isinstance(ref.cell, gdstk.Cell) else ref.cell
@@ -1302,11 +1681,10 @@ class MainWindow(QMainWindow):
         elif project.cells: 
             project.top = list(project.cells.keys())[0]
         else:
-             # If there are no cells at all, create an empty TOP cell to prevent crashes
             project.top = "TOP"
             project.cells["TOP"] = Cell()
 
-        self.current_file_path = None
+        self.current_file_path = None # Don't overwrite GDS
         self.initialize_project(project)
 
     def save_json(self):
@@ -1342,25 +1720,38 @@ class MainWindow(QMainWindow):
         try:
             units_in_meters = {'um': 1e-6, 'nm': 1e-9, 'mm': 1e-3}
             unit_value = units_in_meters.get(self.project.units.lower(), 1e-6) # Defaults to um
-            lib = gdstk.Library(unit=unit_value)            
+            lib = gdstk.Library(unit=unit_value) 
             layer_map = {layer.name: i for i, layer in enumerate(self.project.layers, 1)}
             gds_cells = {name: lib.new_cell(name) for name in self.project.cells}
             for name, cell in self.project.cells.items():
                 gds_cell = gds_cells[name]
                 for p in cell.polygons: gds_cell.add(gdstk.Polygon(p.points, layer=layer_map.get(p.layer, 0)))
                 for e in cell.ellipses:
-                    r = e.rect; center = (r[0]+r[2]/2, r[1]+r[3]/2); radius = (r[2]/2)
+                    r = e.rect; center = (r[0]+r[2]/2, r[1]+r[3]/2); 
+                    radius = (r[2] + r[3]) / 4 # Average radius for ellipse approx
                     gds_cell.add(gdstk.ellipse(center, radius, layer=layer_map.get(e.layer, 0)))
                 for r in cell.references:
                     if r.cell in gds_cells:
                         gds_cell.add(gdstk.Reference(gds_cells[r.cell], r.origin, r.rotation, r.magnification))
-            lib.write_oas(path) if is_oas else lib.write_gds(path)
-            meta = {layer_map[l.name]: {'name': l.name, 'color': l.color, 'visible': l.visible} for l in self.project.layers if l.name in layer_map}
+            
+            if is_oas: lib.write_oas(path)
+            else: lib.write_gds(path)
+            
+            # Save metadata including fill_pattern and thickness
+            meta = {layer_map[l.name]: {
+                        'name': l.name, 
+                        'color': l.color, 
+                        'visible': l.visible,
+                        'fill_pattern': l.fill_pattern,
+                        'thickness_2_5d': getattr(l, 'thickness_2_5d', 10.0) # Save thickness
+                    } for l in self.project.layers if l.name in layer_map}
+            
             with open(path + '.json', 'w') as f: json.dump({'layer_metadata': meta}, f, indent=2)
             self.statusBar().showMessage(f"Exported to {path} and created metadata file.")
         except Exception as e: QMessageBox.critical(self, "Export Error", f"Failed to write file: {e}")
         finally: QApplication.restoreOverrideCursor()
 
+    # UPDATED to handle new ProcessDialog
     def run_process_step(self):
         """Opens the process simulation dialog and applies the selected fabrication step."""
         if not self.project:
@@ -1373,33 +1764,73 @@ class MainWindow(QMainWindow):
 
         values = dlg.get_values()
         step = values["step"]
-        parameter = values["parameter"]
+        ptype = values["type"]
+        layer1 = values["layer1"]
+        layer2 = values["layer2"]
+        param1 = values["param1"]
+        param2 = values["param2"]
 
+        # --- Dispatching ---
         if step == "Deposition":
-            self._apply_deposition(values["layer"], parameter, True)
+            # Option 1: Basic thickness update for 2.5D view
+            self._apply_deposition(layer1, param1, True)
+            # Option 2: Trigger Level Set (adds to new layer)
+            # Note: speed needs interpretation from thickness/time
+            # self.run_level_set_simulation(
+            #     target_layer_name=layer1, process_type="deposit",
+            #     duration=1.0, speed=param1 if param1 else 10.0, # Example mapping
+            #     grid_resolution=self.project.grid_pitch / 10.0
+            # )
+
+        elif step == "Etch":
+            if layer1 and layer2:
+                 # 1. Update etch pairs for 2.5D view and set mask style
+                self._apply_etching(layer1, layer2, param2 if param2 is not None else 100) # Use depth (param2)
+                # 2. Trigger Level Set (adds to new layer)
+                # Note: This basic version simulates etching layer1 using itself as a mask boundary
+                etch_depth = param2 if param2 is not None else 100.0
+                etch_speed = 10.0 # Example speed
+                duration = etch_depth / etch_speed if etch_speed > 0 else 0
+                self.run_level_set_simulation(
+                    target_layer_name=layer1, # Simulating change *on* this layer's shapes
+                    process_type="etch",
+                    duration=duration,
+                    speed=etch_speed,
+                    grid_resolution=self.project.grid_pitch / 10.0 # Example resolution
+                )
+            else:
+                 QMessageBox.warning(self, "Input Error", "Etching requires both a Mask and Substrate layer.")
+                 return # Return here, don't save/redraw
+
         elif step == "Doping":
             active_cell = self.project.cells.get(self.active_cell_name)
+            if not active_cell: return
             shapes_to_process = []
             if self.scene.selectedItems():
-                shapes_to_process = [item.data_obj for item in self.scene.selectedItems()
-                                if hasattr(item, 'data_obj') and item.data_obj.layer == values["layer"]]
-            else:
-                shapes_to_process = [p for p in active_cell.polygons if p.layer == values["layer"]]
-                shapes_to_process.extend([e for e in active_cell.ellipses if e.layer == values["layer"]])
-            self._apply_doping(shapes_to_process, values["layer"], parameter, True)
-        # Inside run_process_step...
-        elif step == "Etching":
-            self._apply_etching(values["mask_layer"], values["substrate_layer"], parameter)
+                 shapes_to_process = [item.data_obj for item in self.scene.selectedItems()
+                                      if hasattr(item, 'data_obj') and item.data_obj.layer == layer1]
+            else: # If nothing selected, process all shapes on the target layer in the current cell
+                 shapes_to_process = [p for p in active_cell.polygons if p.layer == layer1]
+                 shapes_to_process.extend([e for e in active_cell.ellipses if e.layer == layer1])
+            dose = param1 if param1 is not None else 1e13
+            self._apply_doping(shapes_to_process, layer1, dose, True)
 
-        self._save_state()
-        self._redraw_scene()
-        self.statusBar().showMessage(f"Applied {step} successfully.")
+        elif step == "Oxidation":
+             self.placeholder_function(f"Oxidation: {ptype} on {layer1}, Thickness={param1}")
+        else:
+             self.placeholder_function(f"Process: {step} - {ptype}, L1={layer1}, L2={layer2}, P1={param1}, P2={param2}")
+
+        # --- Common Actions ---
+        # Save state and redraw are now typically handled within the specific apply/simulate functions
+        # self._save_state() # Removed - happens in sub-functions
+        # self._redraw_scene() # Removed - happens in sub-functions
+        self.statusBar().showMessage(f"Applied {step} - {ptype}.") # Show generic message
 
 
     def _apply_deposition(self, layer_name, thickness, visual_effect):
         """Simulates deposition by adding a uniform layer."""
         target_layer = self.project.layer_by_name.get(layer_name)
-        if not target_layer:
+        if not target_layer or thickness is None:
             return
 
         # Store process history as layer metadata
@@ -1411,27 +1842,35 @@ class MainWindow(QMainWindow):
             'thickness': thickness
         })
 
-        current = getattr(target_layer, 'thickness_3d', 10)
-        target_layer.thickness_3d = max(0, current + thickness)
+        current = getattr(target_layer, 'thickness_2_5d', 10.0) # Ensure default is float
+        target_layer.thickness_2_5d = max(0.0, current + thickness) # Ensure float arithmetic
+
 
         if visual_effect:
             # Slightly lighten the layer color to indicate deposition
             r, g, b = target_layer.color
             target_layer.color = (
-                min(255, int(r * 1.1)),
-                min(255, int(g * 1.1)),
-                min(255, int(b * 1.1))
+                min(255, int(r * 1.05)), # Less aggressive change
+                min(255, int(g * 1.05)),
+                min(255, int(b * 1.05))
             )
-
-        QMessageBox.information(self, "Deposition Complete",
-            f"Added {thickness:.0f} nm uniform layer on '{layer_name}'.\n"
-            f"This affects 3D visualization thickness.")
         
+        self._save_state() # Save state after modification
+        self._redraw_scene() # Redraw needed for color change
+        QMessageBox.information(self, "Deposition Complete",
+            f"Added {thickness:.1f} units uniform layer on '{layer_name}'.\n"
+            f"This affects 2.5D visualization thickness.")
+
+    # UPDATED to set fill_pattern
     def _apply_etching(self, mask_layer_name, substrate_layer_name, etch_depth):
-        """Simulates an etch by darkening the mask and recording an etch instruction with depth."""
+        """Simulates an etch by darkening the mask, setting its pattern, and recording an etch instruction."""
         if mask_layer_name == substrate_layer_name:
             QMessageBox.warning(self, "Logic Error", "Mask and Substrate layer cannot be the same.")
             return
+        if etch_depth is None:
+             QMessageBox.warning(self, "Input Error", "Etch depth parameter is missing.")
+             return
+
 
         active_cell = self.project.cells.get(self.active_cell_name)
         mask_layer = self.project.layer_by_name.get(mask_layer_name)
@@ -1440,19 +1879,27 @@ class MainWindow(QMainWindow):
 
         # 1. Darken the mask layer for a simple 2D visual cue
         r, g, b = mask_layer.color
-        mask_layer.color = (max(0, r - 40), max(0, g - 40), max(0, b - 40))
+        mask_layer.color = (max(0, r - 30), max(0, g - 30), max(0, b - 30)) # Less aggressive
 
-        # 2. Record the etch instruction with depth in the cell's data
+        # 2. SET THE FILL PATTERN to make it "special"
+        mask_layer.fill_pattern = "hatch" 
+
+        # 3. Record the etch instruction with depth in the cell's data
         etch_instruction = (mask_layer_name, substrate_layer_name, etch_depth)
         # Avoid duplicate instructions
-        if not any(e[0] == mask_layer_name and e[1] == substrate_layer_name for e in active_cell.etch_pairs):
+        if not any(e == etch_instruction for e in active_cell.etch_pairs):
             active_cell.etch_pairs.append(etch_instruction)
+        else:
+            print(f"Skipping duplicate etch instruction.")
 
-        # 3. Redraw the 2D scene and inform the user
-        self._redraw_scene()
+
+        # 4. Redraw the 2D scene and inform the user
+        self._save_state() # Save state after modification
+        self._redraw_scene() # Redraw needed for style change
         QMessageBox.information(self, "Etch Step Recorded",
-            f"Mask '{mask_layer_name}' will now etch '{substrate_layer_name}' by a depth of {etch_depth} units in the 3D view.")
-        
+            f"Mask '{mask_layer_name}' will now etch '{substrate_layer_name}' by a depth of {etch_depth} units in the 2.5D view.\nMask layer style updated.")
+
+    # UPDATED to set fill_pattern
     def _apply_doping(self, shapes_to_process, layer_name, dose, visual_effect):
         """Simulates doping by moving shapes to a new 'doped' layer and annotating them."""
         if not shapes_to_process:
@@ -1460,6 +1907,9 @@ class MainWindow(QMainWindow):
 
         # Define the new doped layer
         original_layer = self.project.layer_by_name.get(layer_name)
+        if not original_layer:
+             QMessageBox.warning(self, "Error", f"Original layer '{layer_name}' not found for doping.")
+             return
         doped_layer_name = f"{layer_name}_doped"
         doped_layer = self.project.layer_by_name.get(doped_layer_name)
 
@@ -1468,43 +1918,278 @@ class MainWindow(QMainWindow):
             r, g, b = original_layer.color
             # Create a visually distinct color for the doped version
             new_color = (min(255, r + 50), max(0, g - 50), min(255, b + 50))
-            doped_layer = Layer(name=doped_layer_name, color=new_color)
+            # Set fill_pattern on creation
+            doped_layer = Layer(name=doped_layer_name, color=new_color, fill_pattern="cross") # <-- MODIFIED
             self.project.layers.append(doped_layer)
             self.project.refresh_layer_map()
             self._refresh_layer_list() # Update the layer list widget
 
         # Move shapes to the new layer and annotate their names
+        changed = False
         for shape in shapes_to_process:
-            shape.layer = doped_layer_name
+            if shape.layer != doped_layer_name:
+                 shape.layer = doped_layer_name
+                 changed = True
             if hasattr(shape, 'name'):
                 current_name = shape.name or ""
-                shape.name = f"{current_name} (Dose: {dose:.1E})".strip()
-        
-        QMessageBox.information(self, "Doping Complete",
-            f"Applied doping to {len(shapes_to_process)} shape(s).\n"
-            f"Shapes moved to new layer: '{doped_layer_name}'.")
+                new_name = f"{current_name} (Dose: {dose:.1E})".strip()
+                if shape.name != new_name:
+                    shape.name = new_name
+                    changed = True # Name change also counts
+
+        if changed:
+            self._save_state() # Save state after modification
+            self._redraw_scene() # Redraw needed for layer change
+            QMessageBox.information(self, "Doping Complete",
+                f"Applied doping to {len(shapes_to_process)} shape(s).\n"
+                f"Shapes moved to new layer: '{doped_layer_name}'.")
+        else:
+             self.statusBar().showMessage("Selected shapes already doped with this dose.")
+
+
+    # --- LEVEL SET SOLVER (Basic Implementation) ---
+    def run_level_set_simulation(self, target_layer_name, process_type="etch", duration=10.0, speed=1.0, grid_resolution=1.0):
+        """
+        Performs a basic Level Set simulation on the target layer.
+        process_type: 'etch' (positive speed) or 'deposit' (negative speed)
+        duration: Total simulation time.
+        speed: Rate of surface movement (positive for etch, negative for deposit).
+        grid_resolution: Size of one grid cell in project units.
+        """
+        if not _has_level_set_deps: # Check if libraries loaded
+             QMessageBox.warning(self, "Missing Libraries", "NumPy, SciPy, and Scikit-Image are required for Level Set simulation.")
+             return
+        if not self.project: return
+
+        active_cell = self.project.cells.get(self.active_cell_name)
+        if not active_cell: return
+
+        target_polys_data = [p.points for p in active_cell.polygons if p.layer == target_layer_name]
+        # TODO: Convert ellipses and flatten references for a complete simulation domain
+
+        if not target_polys_data:
+            self.statusBar().showMessage(f"No shapes found on layer '{target_layer_name}' for Level Set.")
+            return
+
+        # --- 1. Get Bounding Box ---
+        min_x, min_y, max_x, max_y = float('inf'), float('inf'), float('-inf'), float('-inf')
+        for points in target_polys_data:
+            if not points: continue
+            try:
+                xs, ys = zip(*points)
+                min_x, min_y = min(min_x, min(xs)), min(min_y, min(ys))
+                max_x, max_y = max(max_x, max(xs)), max(max_y, max(ys))
+            except ValueError: continue # Skip if points list was empty
+
+        if not all(math.isfinite(v) for v in [min_x, min_y, max_x, max_y]):
+             QMessageBox.warning(self, "Simulation Error", "Cannot determine bounds for simulation.")
+             return
+
+        margin = 5 * grid_resolution
+        min_x -= margin; min_y -= margin; max_x += margin; max_y += margin
+
+        # --- 2. Create Grid and Initial Phi ---
+        grid_width = int(np.ceil((max_x - min_x) / grid_resolution))
+        grid_height = int(np.ceil((max_y - min_y) / grid_resolution))
+        if grid_width <= 1 or grid_height <= 1:
+             QMessageBox.warning(self, "Simulation Error", "Simulation grid size too small. Check shapes or resolution.")
+             return
+
+        x_coords = np.linspace(min_x, max_x, grid_width)
+        y_coords = np.linspace(min_y, max_y, grid_height)
+        grid_x, grid_y = np.meshgrid(x_coords, y_coords)
+        grid_points = np.vstack([grid_x.ravel(), grid_y.ravel()]).T # Shape (N, 2)
+
+        inside_mask = np.zeros(grid_points.shape[0], dtype=bool)
+        if Path: # Check if Path is available
+            for points in target_polys_data:
+                 if len(points) >= 3: # Path requires at least 3 points
+                     path = Path(points)
+                     inside_mask |= path.contains_points(grid_points)
+        else:
+             QMessageBox.warning(self, "Missing Library", "Matplotlib Path needed for shape containment check.")
+             return
+
+        inside_mask = inside_mask.reshape(grid_height, grid_width)
+
+        try:
+             # Calculate signed distance function (SDF) phi
+             phi = distance_transform_edt(inside_mask) - distance_transform_edt(~inside_mask)
+        except Exception as e:
+             QMessageBox.critical(self, "SDF Error", f"Failed to compute initial distance field: {e}")
+             return
+
+        # --- 3. Simple Simulation Loop ---
+        safe_speed = max(abs(speed), 1e-9) # Avoid division by zero
+        dt = 0.4 * grid_resolution / safe_speed # CFL condition estimate (0.4 is safer than 0.1)
+        if dt <= 0:
+             QMessageBox.warning(self, "Simulation Error", "Calculated timestep is zero or negative.")
+             return
+        num_steps = int(duration / dt) if duration > 0 else 0
+        if num_steps <= 0:
+            QMessageBox.information(self, "Simulation Info", "Duration or speed results in zero simulation steps.")
+            return
+
+
+        current_phi = phi.copy()
+        F = speed if process_type == "etch" else -abs(speed)
+
+        print(f"Starting Level Set: {num_steps} steps, dt={dt:.4f}, F={F:.2f}")
+        QApplication.setOverrideCursor(Qt.WaitCursor) # Show busy cursor
+        try:
+            for step in range(num_steps):
+                phi_x_plus = np.roll(current_phi, -1, axis=1) - current_phi
+                phi_x_minus = current_phi - np.roll(current_phi, 1, axis=1)
+                phi_y_plus = np.roll(current_phi, -1, axis=0) - current_phi
+                phi_y_minus = current_phi - np.roll(current_phi, 1, axis=0)
+
+                # Upwind gradient magnitude squared calculation
+                grad_phi_sq_term_x = np.zeros_like(current_phi)
+                grad_phi_sq_term_y = np.zeros_like(current_phi)
+
+                if F > 0: # Etching
+                    grad_phi_sq_term_x = np.maximum(phi_x_minus / grid_resolution, 0)**2 + np.minimum(phi_x_plus / grid_resolution, 0)**2
+                    grad_phi_sq_term_y = np.maximum(phi_y_minus / grid_resolution, 0)**2 + np.minimum(phi_y_plus / grid_resolution, 0)**2
+                else: # Deposition
+                    grad_phi_sq_term_x = np.minimum(phi_x_minus / grid_resolution, 0)**2 + np.maximum(phi_x_plus / grid_resolution, 0)**2
+                    grad_phi_sq_term_y = np.minimum(phi_y_minus / grid_resolution, 0)**2 + np.maximum(phi_y_plus / grid_resolution, 0)**2
+
+                grad_phi_mag = np.sqrt(grad_phi_sq_term_x + grad_phi_sq_term_y)
+
+                # Update phi: phi_t = -F * |grad(phi)|
+                current_phi -= dt * F * grad_phi_mag
+
+                # Basic progress update
+                if step % (max(1, num_steps // 10)) == 0:
+                    print(f" Step {step}/{num_steps}")
+                    QApplication.processEvents() # Keep UI responsive
+
+            print("Level Set Simulation Finished.")
+        except Exception as e:
+            QMessageBox.critical(self, "Simulation Runtime Error", f"Error during level set update: {e}")
+            return
+        finally:
+            QApplication.restoreOverrideCursor()
+
+
+        # --- 4. Extract Contours ---
+        try:
+            # Note: find_contours assumes y, x order (row, col)
+            contours = find_contours(current_phi, level=0.0)
+        except Exception as e:
+            QMessageBox.critical(self, "Contour Error", f"Failed to extract contours: {e}")
+            return
+
+        # --- 5. Add Results to Project ---
+        result_polygons_data = []
+        for contour in contours:
+            # Convert contour indices (row, col) back to project coordinates (x, y)
+            points_xy = []
+            for row, col in contour:
+                # Interpolation for slightly smoother coords
+                x = min_x + col * grid_resolution
+                y = min_y + row * grid_resolution
+                points_xy.append((x, y))
+
+            if len(points_xy) >= 3:
+                 result_polygons_data.append(points_xy)
+
+        if result_polygons_data:
+            result_layer_name = f"{target_layer_name}_sim_{process_type}"
+            result_layer = self.project.layer_by_name.get(result_layer_name)
+            if not result_layer:
+                original_color = self.project.layer_by_name[target_layer_name].color
+                # Make result color slightly different
+                new_r = min(255, max(0, original_color[0] + (30 if process_type=='deposit' else -30)))
+                new_g = min(255, max(0, original_color[1] + (30 if process_type=='deposit' else -30)))
+                new_b = min(255, max(0, original_color[2] + (30 if process_type=='deposit' else -30)))
+                result_layer = Layer(name=result_layer_name, color=(new_r, new_g, new_b), fill_pattern="dots")
+                self.project.layers.append(result_layer)
+                self.project.refresh_layer_map()
+                self._refresh_layer_list()
+
+            num_added = 0
+            for points in result_polygons_data:
+                active_cell.polygons.append(Poly(layer=result_layer_name, points=points))
+                num_added += 1
+
+            if num_added > 0:
+                self._save_state()
+                self._redraw_scene()
+                self.statusBar().showMessage(f"Level Set result ({num_added} polys) added to '{result_layer_name}'.")
+            else:
+                 self.statusBar().showMessage("Level Set simulation complete, but no valid polygons generated.")
+        else:
+            self.statusBar().showMessage("Level Set simulation did not produce any contours.")
+
+
+    # --- Placeholder functions for new UI buttons ---
+    def placeholder_function(self, message="Not implemented yet."):
+         QMessageBox.information(self, "Placeholder", message)
+
+    def run_recipe_loop(self): self.placeholder_function("Run Recipe Loop (DRIE/Bosch)")
+    def show_virtual_cross_section(self): self.placeholder_function("Show Virtual Cross-Section")
+    def reset_process_simulation(self):
+        # Clear etch pairs and potentially reset layer thicknesses/colors/patterns
+        if not self.project: return
+        active_cell = self.project.cells.get(self.active_cell_name)
+        if active_cell:
+            active_cell.etch_pairs.clear()
+        # Reset layer appearances (optional - might want to keep thickness changes)
+        # for layer in self.project.layers:
+        #    layer.fill_pattern = 'solid'
+        #    # Reset color? Reset thickness?
+        self._save_state()
+        self._redraw_scene()
+        QMessageBox.information(self, "Process Reset", "Simulated 2.5D etch effects have been cleared.")
+
+    def run_locos(self): self.placeholder_function("Run Quick Recipe: Grow Oxide (LOCOS)")
+    def run_lift_off(self): self.placeholder_function("Run Quick Recipe: Metal Lift-off")
+    def run_sti_etch(self): self.placeholder_function("Run Quick Recipe: Trench Etch (STI)")
+    def run_damascene(self): self.placeholder_function("Run Quick Recipe: Damascene Fill")
+
+    def toggle_print_contour(self, checked): self.placeholder_function(f"Toggle Print Contour (AI): {'ON' if checked else 'OFF'}")
+    def detect_hotspots(self): self.placeholder_function("Detect Hotspots (AI)")
+    def run_contour_metrology(self): self.placeholder_function("Run Contour Metrology (AI)")
+
 
     # --- UI Building & Core Logic ---
 
-    def _create_themed_icon(self, icon_name):
-        try:
-            script_dir = os.path.dirname(os.path.abspath(__file__)) if "__file__" in locals() else os.getcwd()
-            icon_path = os.path.join(script_dir, 'icons', f'{icon_name}.svg')
-            pixmap = QPixmap(icon_path)
-            if self.palette().color(QPalette.Window).value() < 128:
-                painter = QPainter(pixmap)
-                painter.setCompositionMode(QPainter.CompositionMode_SourceIn)
-                painter.fillRect(pixmap.rect(), Qt.white); painter.end()
+    def _create_themed_icon(self, icon_name, size=32):
+        # 1. Attempt to find the file
+        script_dir = os.path.dirname(os.path.abspath(__file__)) if "__file__" in locals() else os.getcwd()
+        icon_path = os.path.join(script_dir, 'icons', f'{icon_name}.svg')
+        
+        pixmap = QPixmap(icon_path)
+
+        # 2. Check if load failed. If so, create a blank placeholder.
+        if pixmap.isNull():
+            # Create a transparent placeholder so Painter has a valid target
+            pixmap = QPixmap(size, size)
+            pixmap.fill(Qt.transparent)
+            
+            # Optional: Draw the first letter of the icon name as a fallback text
+            painter = QPainter(pixmap)
+            painter.setPen(QPen(Qt.gray))
+            painter.drawText(pixmap.rect(), Qt.AlignCenter, icon_name[:1].upper())
+            painter.end()
             return QIcon(pixmap)
-        except Exception:
-            pixmap = QPixmap(32, 32); pixmap.fill(Qt.transparent)
-            p = QPainter(pixmap); p.setPen(QPen(Qt.gray, 2)); p.drawText(pixmap.rect(), Qt.AlignCenter, icon_name[0].upper()); p.end()
-            return QIcon(pixmap)
+
+        # 3. Apply Dark Mode theme logic ONLY if the pixmap loaded successfully
+        is_dark = self.palette().color(QPalette.Window).value() < 128
+        if is_dark:
+            painter = QPainter(pixmap)
+            # This line caused the crash previously if pixmap was null
+            painter.setCompositionMode(QPainter.CompositionMode_SourceIn) 
+            painter.fillRect(pixmap.rect(), Qt.white)
+            painter.end()
+            
+        return QIcon(pixmap)
 
     def _build_ui(self):
         self.tool_buttons = {}
         self._create_shortcuts()
-        self._build_tool_tabs()
+        self._build_tool_tabs() # This now builds all tabs including the new one
         self._build_cell_dock(); self._build_layer_dock()
         self.set_active_tool("select")
 
@@ -1534,7 +2219,7 @@ class MainWindow(QMainWindow):
             ("Circle Tool", "C", lambda: self.set_active_tool("circle")),
             ("Path Tool", "W", lambda: self.set_active_tool("path")),
         ]
-        
+
         for text, shortcut_keys, slot in shortcuts:
             action = QAction(text, self)
             if isinstance(shortcut_keys, (list, tuple)):
@@ -1545,13 +2230,15 @@ class MainWindow(QMainWindow):
             action.triggered.connect(slot)
             self.addAction(action)
 
+    # UPDATED: Builds all tabs now
     def _build_tool_tabs(self):
         dock = QDockWidget(self); dock.setTitleBarWidget(QWidget()); dock.setAllowedAreas(Qt.TopDockWidgetArea | Qt.BottomDockWidgetArea)
-        dock.setFeatures(QDockWidget.DockWidgetMovable); tabs = QTabWidget(); dock.setWidget(tabs)
+        dock.setFeatures(QDockWidget.DockWidgetMovable); self.tabs = QTabWidget(); dock.setWidget(self.tabs) # Store tabs ref
 
+        # --- Main Tab ---
         main_tab = QWidget(); main_layout = QHBoxLayout(main_tab)
         main_layout.setAlignment(Qt.AlignLeft); main_layout.setContentsMargins(0, 5, 0, 5)
-        
+
         export_button = QToolButton(); export_button.setText("Export"); export_button.setIcon(self._create_themed_icon("upload"))
         export_button.setIconSize(QSize(24, 24)); export_button.setToolButtonStyle(Qt.ToolButtonTextUnderIcon)
         export_button.setPopupMode(QToolButton.MenuButtonPopup)
@@ -1575,7 +2262,7 @@ class MainWindow(QMainWindow):
             self._create_action_button("Delete", "trash-2", self.delete_selected_items),
         ]))
         main_layout.addWidget(self._create_ribbon_group("History", [
-            self._create_action_button("Undo", "corner-up-left", self.undo), 
+            self._create_action_button("Undo", "corner-up-left", self.undo),
             self._create_action_button("Redo", "corner-up-right", self.redo)
         ]))
         grid_widget = QWidget(); grid_layout = QVBoxLayout(grid_widget)
@@ -1589,18 +2276,19 @@ class MainWindow(QMainWindow):
         main_layout.addWidget(self._create_ribbon_group("Help", [
             self._create_action_button("User Guide", "help-circle", self.show_help_pdf)
         ]))
-        main_layout.addStretch(); tabs.addTab(main_tab, "Main")
+        main_layout.addStretch(); self.tabs.addTab(main_tab, "Main")
 
+        # --- Draw Tab ---
         draw_tab = QWidget(); draw_layout = QHBoxLayout(draw_tab)
         draw_layout.setAlignment(Qt.AlignLeft); draw_layout.setContentsMargins(0, 5, 0, 5)
         draw_layout.addWidget(self._create_ribbon_group("Create", [
-            self._create_tool_button("rect", "Rectangle", "square"), 
-            self._create_tool_button("circle", "Circle", "circle"), 
+            self._create_tool_button("rect", "Rectangle", "square"),
+            self._create_tool_button("circle", "Circle", "circle"),
             self._create_tool_button("poly", "Polygon", "pen-tool"),
-            self._create_action_button("Finish Poly", "check-square", lambda: self.view.finish_polygon()),
+            self._create_action_button("Finish Poly", "check-square", lambda: self.view.finish_polygon() if hasattr(self, 'view') else None),
             self._create_tool_button("path", "Path/Wire", "git-branch")
         ]))
-        
+
         move_layer_btn = QToolButton(); move_layer_btn.setText("Move Layer"); move_layer_btn.setIcon(self._create_themed_icon("layers"))
         move_layer_btn.setIconSize(QSize(24, 24)); move_layer_btn.setToolButtonStyle(Qt.ToolButtonTextUnderIcon)
         move_layer_btn.setPopupMode(QToolButton.MenuButtonPopup)
@@ -1613,7 +2301,7 @@ class MainWindow(QMainWindow):
         arrange_btn.setIconSize(QSize(24, 24))
         arrange_btn.setToolButtonStyle(Qt.ToolButtonTextUnderIcon)
         arrange_btn.setPopupMode(QToolButton.MenuButtonPopup)
-        
+
         arrange_menu = QMenu(self)
         bf_action = arrange_menu.addAction("Bring to Front")
         bf_action.triggered.connect(self.bring_selection_to_front)
@@ -1641,17 +2329,17 @@ class MainWindow(QMainWindow):
             self._create_action_button("Subtract", "minus-square", lambda: self._run_boolean_op('not')),
             self._create_action_button("Intersect", "crop", lambda: self._run_boolean_op('and'))
         ]))
-        process_btn = self._create_action_button("Simulate", "cpu", self.run_process_step)
-        draw_layout.addWidget(self._create_ribbon_group("Process", [process_btn]))
-        draw_layout.addStretch(); tabs.addTab(draw_tab, "Draw")
+        # REMOVED Process button from here
+        draw_layout.addStretch(); self.tabs.addTab(draw_tab, "Draw")
 
+        # --- View Tab ---
         view_tab = QWidget(); view_layout = QHBoxLayout(view_tab)
         view_layout.setAlignment(Qt.AlignLeft); view_layout.setContentsMargins(0, 5, 0, 5)
         toggle_rulers_btn = self._create_action_button("Rulers", "table", lambda checked: self.toggle_rulers(checked))
         toggle_rulers_btn.setCheckable(True); toggle_rulers_btn.setChecked(True)
         view_layout.addWidget(self._create_ribbon_group("Display", [
             self._create_action_button("Fill", "maximize", self.fill_view),
-            self._create_action_button("3D View", "box", self.show_3d_view),
+            self._create_action_button("2.5D View", "box", self.show_2_5d_view), # RENAMED
             toggle_rulers_btn, self._create_tool_button("measure", "Measure", "compass")
         ]))
         view_layout.addWidget(self._create_ribbon_group("Zoom", [
@@ -1660,8 +2348,47 @@ class MainWindow(QMainWindow):
         view_layout.addWidget(self._create_ribbon_group("Layer Visibility", [
             self._create_action_button("Show All", "eye", self.show_all_layers), self._create_action_button("Hide All", "eye-off", self.hide_all_layers)
         ]))
-        view_layout.addStretch(); tabs.addTab(view_tab, "View")
+        view_layout.addStretch(); self.tabs.addTab(view_tab, "View")
+
+        # --- Process Tab (NEW) ---
+        process_tab = QWidget(); process_layout = QHBoxLayout(process_tab)
+        process_layout.setAlignment(Qt.AlignLeft); process_layout.setContentsMargins(0, 5, 0, 5)
+
+        process_layout.addWidget(self._create_ribbon_group("Process Simulation", [
+            self._create_action_button("Add Step...", "sliders", self.run_process_step), # Opens enhanced dialog
+            self._create_action_button("Loop...", "repeat", self.run_recipe_loop),
+            self._create_action_button("Show 2.5D", "box", self.show_2_5d_view),
+            self._create_action_button("Show 3D", "box", self.show_3d_view),
+            self._create_action_button("X-Section", "scissors", self.show_virtual_cross_section),
+            self._create_action_button("Reset", "refresh-cw", self.reset_process_simulation),
+        ]))
+
+        process_layout.addWidget(self._create_ribbon_group("Quick Recipes", [
+             self._create_action_button("LOCOS", "thermometer", self.run_locos),
+             self._create_action_button("Lift-off", "chevrons-up-down", self.run_lift_off),
+             self._create_action_button("STI Etch", "chevrons-down", self.run_sti_etch),
+             self._create_action_button("Damascene", "droplet", self.run_damascene),
+        ]))
+
+        process_layout.addStretch(); self.tabs.addTab(process_tab, "Process") # NEW TAB
+
+        # --- Lithography Tab (NEW) ---
+        litho_tab = QWidget(); litho_layout = QHBoxLayout(litho_tab)
+        litho_layout.setAlignment(Qt.AlignLeft); litho_layout.setContentsMargins(0, 5, 0, 5)
+
+        contour_toggle_btn = self._create_action_button("Contour", "aperture", self.toggle_print_contour)
+        contour_toggle_btn.setCheckable(True) # Make it a toggle button
+        litho_layout.addWidget(self._create_ribbon_group("Lithography (AI)", [
+            contour_toggle_btn,
+            self._create_action_button("Hotspots", "alert-triangle", self.detect_hotspots),
+            self._create_action_button("Measure CD", "ruler", self.run_contour_metrology),
+        ]))
+
+        litho_layout.addStretch(); self.tabs.addTab(litho_tab, "Lithography") # NEW TAB
+
+        # Add the dock widget containing all tabs
         self.addDockWidget(Qt.TopDockWidgetArea, dock)
+
 
     def _create_tool_button(self, name, text, icon):
         btn = QToolButton(); btn.setText(text); btn.setIcon(self._create_themed_icon(icon))
@@ -1694,6 +2421,14 @@ class MainWindow(QMainWindow):
     def set_active_tool(self, tool_name):
         if hasattr(self, 'view') and self.view: self.view.set_mode(tool_name)
         for name, btn in self.tool_buttons.items(): btn.setChecked(name == tool_name)
+        # Ensure correct tab is shown when a tool from a specific tab is activated
+        if hasattr(self, 'tabs'): # Check if tabs are built yet
+            if tool_name in ["rect", "circle", "poly", "path"]:
+                self.tabs.setCurrentIndex(1) # Draw tab
+            elif tool_name in ["measure"]:
+                 self.tabs.setCurrentIndex(2) # View tab
+            elif tool_name in ["select", "move"]:
+                 self.tabs.setCurrentIndex(0) # Main tab
 
     def _build_cell_dock(self):
         dock = QDockWidget("Cells", self)
@@ -1701,7 +2436,7 @@ class MainWindow(QMainWindow):
         self.list_cells.setDragEnabled(True)
         self.list_cells.itemDoubleClicked.connect(self._on_cell_double_clicked)
         widget, layout = QWidget(), QVBoxLayout()
-        layout.addWidget(QLabel("Double-click to edit, Drag to instantiate")); 
+        layout.addWidget(QLabel("Double-click to edit, Drag to instantiate"));
         layout.addWidget(self.list_cells)
         btns = QHBoxLayout()
         for label, func in [("Add", self.add_cell_dialog), ("Rename", self.rename_cell_dialog), ("Delete", self.delete_cell_dialog)]:
@@ -1735,7 +2470,9 @@ class MainWindow(QMainWindow):
             self.project.top = list(self.project.cells.keys())[0] if self.project.cells else None
         if not self.active_cell_name or self.active_cell_name not in self.project.cells:
             self.active_cell_name = self.project.top
-        self.spin_grid.setValue(self.project.grid_pitch)
+        # Ensure spin_grid exists before setting value
+        if hasattr(self, 'spin_grid'):
+            self.spin_grid.setValue(self.project.grid_pitch)
         self._refresh_cell_list(); self._refresh_layer_list(); self._redraw_scene()
 
     def _refresh_cell_list(self):
@@ -1749,14 +2486,17 @@ class MainWindow(QMainWindow):
     def _refresh_layer_list(self):
         self.list_layers.blockSignals(True)
         current = self.active_layer_name; self.list_layers.clear()
-        self.move_layer_menu.clear()
+        # Ensure move_layer_menu exists before clearing
+        if hasattr(self, 'move_layer_menu'):
+            self.move_layer_menu.clear()
         for layer in self.project.layers:
             item = QListWidgetItem(layer.name); item.setIcon(self._create_color_icon(QColor(*layer.color)))
             item.setFlags(item.flags() | Qt.ItemIsUserCheckable); item.setCheckState(Qt.Checked if layer.visible else Qt.Unchecked)
             self.list_layers.addItem(item)
             if layer.name == current: self.list_layers.setCurrentItem(item)
-            action = self.move_layer_menu.addAction(layer.name)
-            action.triggered.connect(lambda checked=False, l=layer.name: self.move_selection_to_layer(l))
+            if hasattr(self, 'move_layer_menu'):
+                action = self.move_layer_menu.addAction(layer.name)
+                action.triggered.connect(lambda checked=False, l_name=layer.name: self.move_selection_to_layer(l_name))
         self.list_layers.blockSignals(False)
 
     def _create_color_icon(self, color, size=16):
@@ -1781,20 +2521,32 @@ class MainWindow(QMainWindow):
     def _save_state(self):
         if not self.project: return
         self._redo_stack.clear()
-        self._undo_stack.append(copy.deepcopy(self.project))
-        if len(self._undo_stack) > 50: self._undo_stack.pop(0)
-        if len(self._undo_stack) > 1: self._mark_dirty()
+        # Save project state *before* potential modification
+        current_state = copy.deepcopy(self.project)
+        # Avoid saving identical consecutive states
+        if not self._undo_stack or self._undo_stack[-1] != current_state:
+             self._undo_stack.append(current_state)
+             if len(self._undo_stack) > 50: self._undo_stack.pop(0)
+             if len(self._undo_stack) > 1: self._mark_dirty()
+
 
     def undo(self):
         if len(self._undo_stack) > 1:
             self._redo_stack.append(self._undo_stack.pop())
             self.project = copy.deepcopy(self._undo_stack[-1])
-            self.update_ui_from_project(); self._mark_dirty()
+            self.update_ui_from_project(); self._mark_dirty() # Should mark as potentially dirty after undo
+            if len(self._undo_stack) == 1: # If only initial state remains, mark as clean
+                self._is_dirty = False
+                self._update_window_title()
+
     def redo(self):
         if self._redo_stack:
-            self.project = self._redo_stack.pop()
-            self._undo_stack.append(copy.deepcopy(self.project))
+            # Need deepcopy here too, otherwise undo/redo share the same object
+            state_to_restore = copy.deepcopy(self._redo_stack.pop())
+            self._undo_stack.append(state_to_restore) # Add the redone state back to undo
+            self.project = state_to_restore # This assignment is okay now
             self.update_ui_from_project(); self._mark_dirty()
+
 
     def add_rect_to_active_cell(self, rect, layer):
         pts = [(rect.left(), rect.top()), (rect.right(), rect.top()), (rect.right(), rect.bottom()), (rect.left(), rect.bottom())]
@@ -1814,14 +2566,14 @@ class MainWindow(QMainWindow):
         sensible_width = self.get_sensible_default_value(divisor=100.0)
 
         width, ok = QInputDialog.getDouble(self, "Path Width", "Enter path width:", sensible_width, 0.001, 10000.0, 3)
-        
+
         if not ok: return
-        
+
         try:
             point_list = [(p.x(), p.y()) for p in points]
             path = gdstk.FlexPath(point_list, width)
             new_polygons = path.to_polygons() # This can return multiple polygons
-            
+
             active_cell = self.project.cells[self.active_cell_name]
             for poly in new_polygons:
                 active_cell.polygons.append(Poly(layer.name, poly.points.tolist()))
@@ -1829,16 +2581,16 @@ class MainWindow(QMainWindow):
             self._redraw_scene(); self._save_state()
         except Exception as e:
             QMessageBox.critical(self, "Path Creation Failed", f"Could not create the path: {e}")
-        
+
     def add_reference_to_active_cell(self, cell_name, pos):
         if cell_name != self.active_cell_name:
-            
+
             bounds = self.get_cell_bounds(cell_name)
-            
+
             if not bounds.isNull():
                 center_offset_x = bounds.center().x()
                 center_offset_y = bounds.center().y()
-                
+
                 new_origin_x = pos.x() - center_offset_x
                 new_origin_y = pos.y() - center_offset_y
             else:
@@ -1848,13 +2600,13 @@ class MainWindow(QMainWindow):
             self.project.cells[self.active_cell_name].references.append(new_ref)
             self._save_state()
             self._redraw_scene()
-                                
+
             for item in self.scene.items():
                 if isinstance(item, RefItem) and item.ref == new_ref:
                     self.scene.clearSelection()
                     item.setSelected(True)
                     break
-            
+
             self.statusBar().showMessage(f"Instantiated cell '{cell_name}' at ({pos.x():.2f}, {-pos.y():.2f})")
 
     def instantiate_cell_on_shape(self, cell_name, target):
@@ -1863,56 +2615,55 @@ class MainWindow(QMainWindow):
             placeholder = QRectF(QPointF(min(xs), min(ys)), QPointF(max(xs), max(ys)))
         elif isinstance(target, Ellipse): placeholder = QRectF(*target.rect)
         else: return
-        
+
         bounds = self.get_cell_bounds(cell_name); mag = 1.0
-        
+
         if not bounds.isNull() and bounds.width() > 0 and bounds.height() > 0:
             mag_x = placeholder.width() / bounds.width()
             mag_y = placeholder.height() / bounds.height()
             mag = min(mag_x, mag_y)
         else:
             mag=1.0
-            
+
         origin_x = placeholder.center().x() - (bounds.center().x() * mag)
         origin_y = placeholder.center().y() - (bounds.center().y() * mag)
-        
+
         active_cell = self.project.cells[self.active_cell_name]
-        
+
         target_name = target.name or type(target).__name__
-        
+
         if isinstance(target, Poly): active_cell.polygons = [p for p in active_cell.polygons if p.uuid != target.uuid]
         elif isinstance(target, Ellipse): active_cell.ellipses = [e for e in active_cell.ellipses if e.uuid != target.uuid]
-        
+
         new_ref = Ref(cell=cell_name, origin=(origin_x, origin_y), magnification=mag)
         active_cell.references.append(new_ref)
-        
+
         self._save_state(); self._redraw_scene()
-        
+
         for item in self.scene.items():
             if isinstance(item, RefItem) and item.ref == new_ref:
                 self.scene.clearSelection()
                 item.setSelected(True)
                 break
-                
+
         self.statusBar().showMessage(f"Instantiated cell '{cell_name}' on '{target_name}' and deleted placeholder.")
 
     def update_data_from_item_move(self, item):
-        bounds = item.mapToScene(item.boundingRect()).boundingRect()
-        delta = self.view.snap_point(bounds.topLeft()) - bounds.topLeft()
-        if delta.x() == 0 and delta.y() == 0: self._save_state(); return
-
+        # Snap logic now part of itemChange, just save the final state
+        pos = item.pos()
         if isinstance(item, RefItem):
-            pos = item.pos() + delta
             item.ref.origin = (pos.x(), pos.y())
         elif isinstance(item, CircleItem):
-            rect = item.mapToScene(item.rect()).boundingRect(); rect.translate(delta)
+            # Recalculate rect based on item's new scene bounding rect
+            rect = item.sceneBoundingRect()
             item.data_obj.rect = (rect.x(), rect.y(), rect.width(), rect.height())
         elif isinstance(item, (PolyItem, RectItem)):
-            poly = item.polygon() if isinstance(item, PolyItem) else QPolygonF(item.rect())
-            poly = item.mapToScene(poly)
-            item.data_obj.points = [(p.x() + delta.x(), p.y() + delta.y()) for p in poly]
-        self._save_state(); self._redraw_scene()
+             poly = item.mapToScene(item.polygon() if isinstance(item, PolyItem) else item.rect())
+             item.data_obj.points = [(p.x(), p.y()) for p in poly]
 
+        self._save_state()
+        # No redraw needed, item is already at new position visually
+        
     def update_data_from_item_edit(self, item):
         if isinstance(item, RectItem):
             r = item.rect()
@@ -1926,16 +2677,17 @@ class MainWindow(QMainWindow):
 
     def delete_selected_items(self):
         if not (self.project and (cell := self.project.cells.get(self.active_cell_name)) and (selected := self.scene.selectedItems())): return
-        
-        to_delete = {item.data_obj for item in selected if hasattr(item, 'data_obj')}
-        to_delete.update({item.ref for item in selected if isinstance(item, RefItem)})
-        
-        if to_delete:
-            self.scene.clearSelection()
-            cell.polygons = [p for p in cell.polygons if p not in to_delete]
-            cell.ellipses = [e for e in cell.ellipses if e not in to_delete]
-            cell.references = [r for r in cell.references if r not in to_delete]
+
+        to_delete_data = {item.data_obj for item in selected if hasattr(item, 'data_obj')}
+        to_delete_refs = {item.ref for item in selected if isinstance(item, RefItem)}
+
+        if to_delete_data or to_delete_refs:
+            self.scene.clearSelection() # Clear selection before modifying list
+            cell.polygons = [p for p in cell.polygons if p not in to_delete_data]
+            cell.ellipses = [e for e in cell.ellipses if e not in to_delete_data]
+            cell.references = [r for r in cell.references if r not in to_delete_refs]
             self._redraw_scene(); self._save_state()
+
 
     def fillet_selected_poly(self):
         if not gdstk: QMessageBox.warning(self, "Feature Disabled", "Please install 'gdstk'."); return
@@ -1943,9 +2695,9 @@ class MainWindow(QMainWindow):
         if not selected: self.statusBar().showMessage("Select one or more polygons to fillet."); return
 
         sensible_radius = self.get_sensible_default_value(divisor=50.0) # A fillet is usually larger
-        
+
         dlg = FilletDialog(self, default_radius=sensible_radius)
-        
+
         if dlg.exec_() == QDialog.Accepted:
             radius = dlg.get_radius()
             for item in selected:
@@ -1956,15 +2708,28 @@ class MainWindow(QMainWindow):
             self._save_state(); self._redraw_scene()
 
     def fill_view(self):
-        if not (self.project and self.scene.items()): return
+        if not (hasattr(self, 'scene') and self.scene.items()): return # Check scene exists
         rect = self.scene.itemsBoundingRect()
         if not rect.isNull():
             margin = max(rect.width(), rect.height()) * 0.05
+            if margin == 0: margin = 10 # Add default if empty or single point
             self.view.fitInView(rect.adjusted(-margin, -margin, margin, margin), Qt.KeepAspectRatio)
-            self.view.zoomChanged.emit()
+            if hasattr(self, 'view'): # Check view exists before emitting
+                self.view.zoomChanged.emit()
 
     def show_3d_view(self):
-        if self.project: ThreeDViewDialog(self.project, self).exec_()
+        if not self.project: return
+        if not _has_3d_deps:
+            QMessageBox.warning(self, "Missing Libraries", 
+                "Install 'pyqtgraph', 'pyopengl', and 'scikit-image' to use the 3D Voxel View.")
+            return
+            
+        dlg = ThreeDViewDialog(self.project, self)
+        dlg.exec_()
+
+    # RENAMED from show_3d_view
+    def show_2_5d_view(self):
+        if self.project: TwoPointFiveDViewDialog(self.project, self).exec_()
 
     def export_svg(self):
         if not self.project:
@@ -1975,7 +2740,7 @@ class MainWindow(QMainWindow):
 
         # 1. Get the exact bounding rectangle of all items
         items_rect = self.scene.itemsBoundingRect()
-        
+
         if not items_rect.isValid() or items_rect.isEmpty():
             QMessageBox.warning(self, "Export Error", "The current cell is empty. Nothing to export.")
             return
@@ -1994,16 +2759,24 @@ class MainWindow(QMainWindow):
         # 4. Render the scene
         painter = QPainter(gen)
         
+        # We need to render the background *if* it's not white, otherwise SVG is transparent
+        # bg_color = self.palette().color(QPalette.Window)
+        # if bg_color != Qt.white:
+        #     painter.fillRect(export_rect, bg_color)
+            
         # CRITICAL FIX: Explicitly tell render() which SOURCE rectangle from the scene to draw.
         # Because the viewBox is already set, we don't need a target rectangle.
         self.scene.render(painter, source=export_rect)
-        
+
         painter.end()
-        
+
         self.statusBar().showMessage(f"Successfully exported SVG to {path}")
 
     def set_grid_pitch(self, value):
-        if self.project: self.project.grid_pitch = value; self.view.viewport().update(); self._mark_dirty()
+        if self.project: self.project.grid_pitch = value
+        if hasattr(self, 'view'): self.view.viewport().update() # Redraw background grid
+        self._mark_dirty()
+
 
     def resnap_all_items_to_grid(self):
         if not self.project: return
@@ -2014,7 +2787,11 @@ class MainWindow(QMainWindow):
         for poly in active_cell.polygons: poly.points = [(snap(p[0]), snap(p[1])) for p in poly.points]
         for ellipse in active_cell.ellipses:
             x, y, w, h = ellipse.rect
-            ellipse.rect = (snap(x), snap(y), max(self.project.grid_pitch, snap(w)), max(self.project.grid_pitch, snap(h)))
+            # Snap position, ensure width/height are at least one grid pitch
+            snapped_x, snapped_y = snap(x), snap(y)
+            snapped_w = max(self.project.grid_pitch, round(w / self.project.grid_pitch) * self.project.grid_pitch)
+            snapped_h = max(self.project.grid_pitch, round(h / self.project.grid_pitch) * self.project.grid_pitch)
+            ellipse.rect = (snapped_x, snapped_y, snapped_w, snapped_h)
         for ref in active_cell.references: ref.origin = (snap(ref.origin[0]), snap(ref.origin[1]))
         self._save_state(); self._redraw_scene()
 
@@ -2040,19 +2817,29 @@ class MainWindow(QMainWindow):
         name = sel[0].text()
         if len(self.project.cells) <= 1: QMessageBox.warning(self, "Delete Error", "Cannot delete the last cell."); return
         if name == self.project.top: QMessageBox.warning(self, "Delete Error", "Cannot delete the top-level cell."); return
+        
+        # Check for references
+        references_found_in = []
         for cell_name, cell in self.project.cells.items():
-            if any(ref.cell == name for ref in cell.references):
-                QMessageBox.warning(self, "Delete Error", f"Cannot delete '{name}' as it is referenced by '{cell_name}'."); return
+             if cell_name == name: continue # Don't check cell against itself
+             if any(ref.cell == name for ref in cell.references):
+                 references_found_in.append(cell_name)
+        
+        if references_found_in:
+            QMessageBox.warning(self, "Delete Error", f"Cannot delete '{name}'. It is referenced by: {', '.join(references_found_in)}."); return
+        
+        # Proceed with deletion
         del self.project.cells[name]
         if self.active_cell_name == name: self.active_cell_name = self.project.top
         self._refresh_cell_list(); self._redraw_scene(); self._save_state()
+
 
     def add_layer_dialog(self):
         if not self.project: return
         name, ok = QInputDialog.getText(self, "Add Layer", "Layer name:")
         if ok and name and name not in self.project.layer_by_name:
             if (color := QColorDialog.getColor()).isValid():
-                new_layer = Layer(name, (color.red(), color.green(), color.blue()))
+                new_layer = Layer(name, (color.red(), color.green(), color.blue())) # Default fill='solid', thickness=10.0
                 self.project.layers.append(new_layer); self.project.refresh_layer_map()
                 self._refresh_layer_list(); self._save_state()
     def rename_layer_dialog(self):
@@ -2060,36 +2847,63 @@ class MainWindow(QMainWindow):
         old_name = sel.text()
         new_name, ok = QInputDialog.getText(self, "Rename Layer", "New name:", text=old_name)
         if ok and new_name and new_name != old_name and new_name not in self.project.layer_by_name:
+            # Update all shapes
             for cell in self.project.cells.values():
                 for p in cell.polygons:
                     if p.layer == old_name: p.layer = new_name
                 for e in cell.ellipses:
                     if e.layer == old_name: e.layer = new_name
-            self.project.layer_by_name[old_name].name = new_name; self.project.refresh_layer_map()
-            if self.active_layer_name == old_name: self.active_layer_name = new_name
-            self._refresh_layer_list(); self._redraw_scene(); self._save_state()
+            # Update layer object itself
+            layer_obj = self.project.layer_by_name.get(old_name)
+            if layer_obj:
+                layer_obj.name = new_name
+                self.project.refresh_layer_map() # Crucial after name change
+                if self.active_layer_name == old_name: self.active_layer_name = new_name
+                self._refresh_layer_list(); self._redraw_scene(); self._save_state()
+            else:
+                QMessageBox.warning(self, "Rename Error", "Could not find layer object to rename.")
+
+
     def delete_layer_dialog(self):
         if not self.project or not (sel := self.list_layers.currentItem()): return
         name = sel.text()
+        
+        # Check for usage
+        usage_found_in = []
         for cell_name, cell in self.project.cells.items():
             if any(p.layer == name for p in cell.polygons) or any(e.layer == name for e in cell.ellipses):
-                QMessageBox.warning(self, "Delete Error", f"Layer '{name}' is in use in cell '{cell_name}'."); return
+                usage_found_in.append(cell_name)
+                break # No need to check further in this cell
+        
+        if usage_found_in:
+             QMessageBox.warning(self, "Delete Error", f"Layer '{name}' is in use in cell '{usage_found_in[0]}'."); return
+
+        # Proceed with deletion
         self.project.layers = [l for l in self.project.layers if l.name != name]; self.project.refresh_layer_map()
         if self.active_layer_name == name: self.active_layer_name = self.project.layers[0].name if self.project.layers else None
         self._refresh_layer_list(); self._save_state()
+
 
     def move_layer_forward(self): self._move_layer(1)
     def move_layer_backward(self): self._move_layer(-1)
     def move_layer_to_top(self):
         if self.project and (sel := self.list_layers.currentItem()) and (layer := self.project.layer_by_name.get(sel.text())):
-            if self.project.layers.index(layer) < len(self.project.layers) - 1:
-                self.project.layers.remove(layer); self.project.layers.append(layer)
-                self._save_state(); self._refresh_layer_list(); self._redraw_scene()
+            try:
+                 idx = self.project.layers.index(layer)
+                 if idx < len(self.project.layers) - 1:
+                    self.project.layers.pop(idx); self.project.layers.append(layer)
+                    self._save_state(); self._refresh_layer_list(); self._redraw_scene()
+            except ValueError: return # Should not happen if layer is in layer_by_name
+
     def move_layer_to_bottom(self):
         if self.project and (sel := self.list_layers.currentItem()) and (layer := self.project.layer_by_name.get(sel.text())):
-            if self.project.layers.index(layer) > 0:
-                self.project.layers.remove(layer); self.project.layers.insert(0, layer)
-                self._save_state(); self._refresh_layer_list(); self._redraw_scene()
+             try:
+                idx = self.project.layers.index(layer)
+                if idx > 0:
+                    self.project.layers.pop(idx); self.project.layers.insert(0, layer)
+                    self._save_state(); self._refresh_layer_list(); self._redraw_scene()
+             except ValueError: return # Should not happen
+
     def _move_layer(self, direction):
         if not self.project or not (sel := self.list_layers.currentItem()): return
         if (layer := self.project.layer_by_name.get(sel.text())):
@@ -2106,22 +2920,28 @@ class MainWindow(QMainWindow):
                 self._refresh_layer_list(); self._redraw_scene(); self._save_state()
 
     def _redraw_scene(self):
-        if not self.project: return
+        if not hasattr(self, 'scene'): return # Guard against early calls
         self.scene.clear()
-        if self.active_cell_name: self._draw_active_cell()
-        if hasattr(self, 'view') and self.view:
+        if self.project and self.active_cell_name: self._draw_active_cell()
+        if hasattr(self, 'view') and self.view and hasattr(self.view, 'MODES'):
             current_mode_name = next((name for name, val in self.view.MODES.items() if val == self.view.mode), "select")
             self.set_active_tool(current_mode_name)
 
     def _is_axis_aligned_rect(self, points):
         if len(points) != 4: return False
-        xs, ys = set(p[0] for p in points), set(p[1] for p in points)
-        return len(xs) == 2 and len(ys) == 2
+        try:
+            xs, ys = set(p[0] for p in points), set(p[1] for p in points)
+            return len(xs) == 2 and len(ys) == 2
+        except Exception:
+             return False # Handle potential errors if points is not as expected
+
 
     def _draw_active_cell(self):
         if not (cell := self.project.cells.get(self.active_cell_name)): return
+        # Draw layers in order - bottom first
         for layer in self.project.layers:
             if not layer.visible: continue
+            # Draw polygons on this layer
             for p_data in cell.polygons:
                 if p_data.layer != layer.name: continue
                 if self._is_axis_aligned_rect(p_data.points):
@@ -2129,10 +2949,13 @@ class MainWindow(QMainWindow):
                     self.scene.addItem(RectItem(QRectF(min(xs), min(ys), max(xs)-min(xs), max(ys)-min(ys)), layer, p_data))
                 else:
                     self.scene.addItem(PolyItem(QPolygonF([QPointF(*pt) for pt in p_data.points]), layer, p_data))
+            # Draw ellipses on this layer
             for e_data in cell.ellipses:
                 if e_data.layer == layer.name: self.scene.addItem(CircleItem(QRectF(*e_data.rect), layer, e_data))
+        # Draw references last (they contain items drawn according to layer order internally)
         for r_data in cell.references:
             if r_data.cell in self.project.cells: self.scene.addItem(RefItem(r_data, self.project.cells[r_data.cell], self.project))
+
 
     def _apply_stylesheet(self):
         self.setStyleSheet("""
@@ -2161,38 +2984,60 @@ class MainWindow(QMainWindow):
             visible_rect = self.view.mapToScene(self.view.viewport().rect()).boundingRect()
 
             if visible_rect.isEmpty() or visible_rect.width() <= 0:
-                return 1.0
+                # Fallback if view/scene is empty or invalid
+                 return self.project.grid_pitch if self.project and self.project.grid_pitch > 0 else 10.0
 
-            default_value = visible_rect.width() / divisor
-            
-            if default_value < 0.01: return 0.01
-            if default_value > 1000: return 1000
+
+            # Use diagonal as a measure of scale, prevent division by zero
+            diag = math.sqrt(visible_rect.width()**2 + visible_rect.height()**2)
+            if diag <= 0: return 1.0
+
+            default_value = diag / divisor # Base on diagonal, not just width
+
+            # Clamp values to reasonable min/max
+            if default_value < 0.001: return 0.001
+            if default_value > 10000: return 10000
 
             return round(default_value, 3)
         except Exception:
-            return 1.0
+            return 10.0 # Generic fallback
 
     def rename_selected_shape(self):
         if not self.project: return
         selected_items = self.scene.selectedItems()
         if len(selected_items) != 1: self.statusBar().showMessage("Please select a single shape to rename."); return
         item = selected_items[0]
-        if not hasattr(item, 'data_obj') or not hasattr(item.data_obj, 'name'):
-            self.statusBar().showMessage("Selected item cannot be named."); return
-        current_name = item.data_obj.name or ""
+        # Allow naming Refs as well
+        target_obj = None
+        if hasattr(item, 'data_obj'): # Poly, Ellipse, Rect
+             if hasattr(item.data_obj, 'name'):
+                 target_obj = item.data_obj
+        # Cannot name Refs directly in the data model yet, skip for now
+        # elif isinstance(item, RefItem):
+        #    # Need to add 'name' field to Ref dataclass if desired
+        #    pass
+
+        if target_obj is None:
+             self.statusBar().showMessage("Selected item cannot be named."); return
+
+        current_name = target_obj.name or ""
         new_name, ok = QInputDialog.getText(self, "Rename Shape", "Enter name:", text=current_name)
-        if ok: item.data_obj.name = new_name if new_name else None; item.setToolTip(item.data_obj.name); self._save_state()
+        if ok:
+            target_obj.name = new_name if new_name else None
+            item.setToolTip(target_obj.name) # Update tooltip immediately
+            self._save_state()
 
     def get_cell_bounds(self, cell_name):
         cell = self.project.cells.get(cell_name)
         if not cell: return QRectF()
-        
+
         total_rect = QRectF()
         is_first = True
 
         def unite_rect(rect_to_add):
             nonlocal total_rect, is_first
-            if is_first and not rect_to_add.isNull():
+            if rect_to_add.isNull() or not rect_to_add.isValid(): return # Skip invalid rects
+            if is_first:
                 total_rect = QRectF(rect_to_add) # Start with the first valid rect
                 is_first = False
             else:
@@ -2200,21 +3045,25 @@ class MainWindow(QMainWindow):
 
         for p_data in cell.polygons:
             if not p_data.points: continue
-            min_x = min(p[0] for p in p_data.points)
-            max_x = max(p[0] for p in p_data.points)
-            min_y = min(p[1] for p in p_data.points)
-            max_y = max(p[1] for p in p_data.points)
-            unite_rect(QRectF(min_x, min_y, max_x - min_x, max_y - min_y))
-                
+            try:
+                min_x = min(p[0] for p in p_data.points)
+                max_x = max(p[0] for p in p_data.points)
+                min_y = min(p[1] for p in p_data.points)
+                max_y = max(p[1] for p in p_data.points)
+                unite_rect(QRectF(min_x, min_y, max_x - min_x, max_y - min_y))
+            except ValueError: continue # Handle empty points list case
+
         for e_data in cell.ellipses:
             unite_rect(QRectF(*e_data.rect))
-        
+
         for ref in cell.references:
+            # Prevent infinite recursion if a cell references itself
+            if ref.cell == cell_name: continue
             child_bounds = self.get_cell_bounds(ref.cell)
             if not child_bounds.isNull():
                 transform = QTransform().translate(ref.origin[0], ref.origin[1]).rotate(ref.rotation).scale(ref.magnification, ref.magnification)
                 unite_rect(transform.mapRect(child_bounds))
-                
+
         return total_rect
 
     def _run_boolean_op(self, op):
@@ -2237,21 +3086,48 @@ class MainWindow(QMainWindow):
                 r = item.rect()
                 center = (r.center().x(), r.center().y())
                 radius = (r.width() / 2, r.height() / 2)
-                gds_polys.append(gdstk.ellipse(center, radius))
+                # gdstk.ellipse returns a Cell, need polygons from it
+                temp_cell = gdstk.ellipse(center, (radius, radius)) # Use tuple for radius
+                gds_polys.extend(temp_cell.polygons)
+
+        if not gds_polys: # Handle case where only circles might have been selected but conversion failed
+             QMessageBox.warning(self, "Boolean Error", "Could not convert selected shapes to polygons."); return
+
         try:
-            result_polys = gdstk.boolean(gds_polys[0], gds_polys[1:], op)
+            # Ensure at least two operands for boolean
+            if len(gds_polys) < 2:
+                 QMessageBox.warning(self, "Boolean Error", "Need at least two valid polygons for operation."); return
+
+            result_polys_or_cells = gdstk.boolean(gds_polys[0], gds_polys[1:], op)
+
+            # gdstk.boolean returns a list of Polygons or sometimes Cells/RobustPaths, normalize to list of points
+            final_result_points = []
+            if result_polys_or_cells:
+                 if isinstance(result_polys_or_cells, list) and len(result_polys_or_cells) > 0:
+                    if isinstance(result_polys_or_cells[0], gdstk.Polygon):
+                          final_result_points = [p.points.tolist() for p in result_polys_or_cells]
+                 elif isinstance(result_polys_or_cells, gdstk.Polygon): # Handle single polygon return
+                     final_result_points = [result_polys_or_cells.points.tolist()]
+                 # Add handling for other potential return types if needed
+
+
         except Exception as e:
             QMessageBox.critical(self, "Boolean Operation Failed", str(e)); return
+
         active_cell = self.project.cells[self.active_cell_name]
         data_to_delete = [item.data_obj for item in selected]
-        uuids_to_delete = {d.uuid for d in data_to_delete}
+        uuids_to_delete = {d.uuid for d in data_to_delete if hasattr(d, 'uuid')} # Check uuid exists
         active_cell.polygons = [p for p in active_cell.polygons if p.uuid not in uuids_to_delete]
         active_cell.ellipses = [e for e in active_cell.ellipses if e.uuid not in uuids_to_delete]
-        for res_poly in result_polys:
-            active_cell.polygons.append(Poly(layer=first_layer, points=res_poly.points.tolist()))
+
+        for res_points in final_result_points:
+             if res_points: # Ensure list is not empty
+                 active_cell.polygons.append(Poly(layer=first_layer, points=res_points))
+
         self._save_state()
         self._redraw_scene()
-        
+
+
     def copy_selected_shapes(self):
         if not self.project or not self.scene.selectedItems():
             return
@@ -2261,12 +3137,15 @@ class MainWindow(QMainWindow):
                 data_dict = asdict(item.data_obj)
                 if isinstance(item.data_obj, Poly): data_dict['type'] = 'poly'
                 elif isinstance(item.data_obj, Ellipse): data_dict['type'] = 'ellipse'
-                selected_data.append(data_dict)
+                # Do not copy Refs for now via clipboard, only shapes
+                if 'type' in data_dict:
+                     selected_data.append(data_dict)
         if selected_data:
             clipboard_data = {"layout_editor_clipboard": selected_data}
             QApplication.clipboard().setText(json.dumps(clipboard_data, cls=ProjectEncoder))
             self.statusBar().showMessage(f"Copied {len(selected_data)} shape(s).")
-            
+
+
     def paste_shapes(self, scene_pos: Optional[QPointF] = None):
         if not self.project: return
         try:
@@ -2279,32 +3158,37 @@ class MainWindow(QMainWindow):
 
             # Calculate center of pasted group
             min_x, max_x, min_y, max_y = float('inf'), float('-inf'), float('inf'), float('-inf')
+            has_valid_shape = False
             for item_data in pasted_items:
-                if item_data.get('type') == 'poly':
+                if item_data.get('type') == 'poly' and item_data.get('points'):
+                    has_valid_shape = True
                     for x, y in item_data['points']:
                         min_x, max_x = min(min_x, x), max(max_x, x)
                         min_y, max_y = min(min_y, y), max(max_y, y)
-                elif item_data.get('type') == 'ellipse':
+                elif item_data.get('type') == 'ellipse' and item_data.get('rect'):
+                    has_valid_shape = True
                     x, y, w, h = item_data['rect']
                     min_x, max_x = min(min_x, x), max(max_x, x + w)
                     min_y, max_y = min(min_y, y), max(max_y, y + h)
 
-            center_x = (min_x + max_x) / 2 if min_x != float('inf') else 0
-            center_y = (min_y + max_y) / 2 if min_y != float('inf') else 0
-            
+            if not has_valid_shape: return # Nothing to paste
+
+            center_x = (min_x + max_x) / 2
+            center_y = (min_y + max_y) / 2
+
             target_pos = self.view.snap_point(scene_pos) if scene_pos else QPointF(center_x + offset, center_y + offset)
             delta = target_pos - QPointF(center_x, center_y)
 
             newly_pasted_data = []
             for item_data in pasted_items:
-                item_data.pop('uuid', None)
+                item_data.pop('uuid', None) # Remove old UUID
                 item_type = item_data.pop('type', None)
-                if item_type == 'poly':
+                if item_type == 'poly' and item_data.get('points'):
                     item_data['points'] = [(p[0] + delta.x(), p[1] + delta.y()) for p in item_data['points']]
                     new_shape = Poly(**item_data)
                     active_cell.polygons.append(new_shape)
                     newly_pasted_data.append(new_shape)
-                elif item_type == 'ellipse':
+                elif item_type == 'ellipse' and item_data.get('rect'):
                     x, y, w, h = item_data['rect']
                     item_data['rect'] = (x + delta.x(), y + delta.y(), w, h)
                     new_shape = Ellipse(**item_data)
@@ -2314,7 +3198,7 @@ class MainWindow(QMainWindow):
             self.statusBar().showMessage(f"Pasted {len(pasted_items)} shape(s).")
             self._save_state()
             self._redraw_scene()
-            
+
             # Select newly pasted items
             self.scene.clearSelection()
             for item in self.scene.items():
@@ -2327,7 +3211,10 @@ class MainWindow(QMainWindow):
     def select_all_items(self):
         if hasattr(self, 'scene'):
             for item in self.scene.items():
-                item.setSelected(True)
+                 # Only select items that are selectable
+                 if item.flags() & QGraphicsItem.ItemIsSelectable:
+                    item.setSelected(True)
+
 
     def zoom_in(self):
         if hasattr(self, 'view'): self.view.scale(1.2, 1.2); self.view.zoomChanged.emit()
@@ -2335,12 +3222,22 @@ class MainWindow(QMainWindow):
         if hasattr(self, 'view'): self.view.scale(1 / 1.2, 1 / 1.2); self.view.zoomChanged.emit()
     def show_all_layers(self):
         if not self.project: return
-        for layer in self.project.layers: layer.visible = True
-        self._refresh_layer_list(); self._redraw_scene(); self._save_state()
+        changed = False
+        for layer in self.project.layers:
+             if not layer.visible:
+                 layer.visible = True
+                 changed = True
+        if changed: self._refresh_layer_list(); self._redraw_scene(); self._save_state()
+
     def hide_all_layers(self):
         if not self.project: return
-        for layer in self.project.layers: layer.visible = False
-        self._refresh_layer_list(); self._redraw_scene(); self._save_state()
+        changed = False
+        for layer in self.project.layers:
+             if layer.visible:
+                 layer.visible = False
+                 changed = True
+        if changed: self._refresh_layer_list(); self._redraw_scene(); self._save_state()
+
     def toggle_rulers(self, checked):
         if hasattr(self, 'canvas_container'):
             self.canvas_container.h_ruler.setVisible(checked)
@@ -2348,99 +3245,165 @@ class MainWindow(QMainWindow):
 
     def show_properties_dialog_for_item(self, item):
         """Opens the correct properties dialog for the given graphics item."""
-        if not item or not hasattr(item, 'data_obj'): return
-        if isinstance(item, (RectItem, PolyItem)):
-            if isinstance(item, RectItem):
-                r = item.rect()
-                kind, params = "rect", {"x": r.x(), "y": r.y(), "w": r.width(), "h": r.height()}
-            else:
-                pts = [(p.x(), p.y()) for p in item.polygon()]
-                kind, params = "poly", {"points": pts}
+        if not item: return
+
+        target_obj = None
+        kind = None
+        params = {}
+
+        if isinstance(item, RectItem) and hasattr(item, 'data_obj'):
+            target_obj = item.data_obj
+            r = item.rect()
+            kind, params = "rect", {"x": r.x(), "y": r.y(), "w": r.width(), "h": r.height()}
+        elif isinstance(item, PolyItem) and hasattr(item, 'data_obj'):
+             target_obj = item.data_obj
+             pts = [(p.x(), p.y()) for p in item.polygon()]
+             kind, params = "poly", {"points": pts}
+        elif isinstance(item, CircleItem) and hasattr(item, 'data_obj'):
+             target_obj = item.data_obj
+             r = item.rect()
+             params = {"center_x": r.center().x(), "center_y": r.center().y(), "w": r.width(), "h": r.height()}
+             kind = "circle"
+        # Add RefItem editing later if needed (Origin, Rotation, Mag)
+        # elif isinstance(item, RefItem):
+        #    target_obj = item.ref ...
+
+        if kind and target_obj:
             dlg = ShapeEditDialog(kind, params, self.view)
             if dlg.exec_() == QDialog.Accepted and (vals := dlg.get_values()):
-                if kind == "rect": item.setRect(QRectF(vals["x"], vals["y"], vals["w"], vals["h"]))
-                else: item.setPolygon(QPolygonF([QPointF(x, y) for x, y in vals["points"]]))
-                self.update_data_from_item_edit(item)
-        elif isinstance(item, CircleItem):
-            r = item.rect()
-            params = {"center_x": r.center().x(), "center_y": r.center().y(), "w": r.width(), "h": r.height()}
-            dlg = ShapeEditDialog("circle", params, self.view)
-            if dlg.exec_() == QDialog.Accepted and (vals := dlg.get_values()):
-                cx, cy, w, h = vals["center_x"], vals["center_y"], vals["w"], vals["h"]
-                item.setRect(QRectF(cx - w / 2, cy - h / 2, w, h))
-                self.update_data_from_item_edit(item)
+                original_data = copy.deepcopy(target_obj) # For undo
+                try:
+                    if kind == "rect":
+                        item.setRect(QRectF(vals["x"], vals["y"], vals["w"], vals["h"]))
+                        # Update data_obj points from new rect
+                        r = item.rect()
+                        target_obj.points = [(r.left(), r.top()), (r.right(), r.top()), (r.right(), r.bottom()), (r.left(), r.bottom())]
+                    elif kind == "poly":
+                        new_points = [QPointF(x, y) for x, y in vals["points"]]
+                        if len(new_points) >= 3: # Basic validation
+                            item.setPolygon(QPolygonF(new_points))
+                            target_obj.points = vals["points"]
+                        else:
+                             QMessageBox.warning(self, "Invalid Polygon", "A polygon requires at least 3 vertices.")
+                             return # Don't save invalid state
+                    elif kind == "circle":
+                        cx, cy, w, h = vals["center_x"], vals["center_y"], vals["w"], vals["h"]
+                        item.setRect(QRectF(cx - w / 2, cy - h / 2, w, h))
+                        target_obj.rect = (cx - w / 2, cy - h / 2, w, h)
+
+                    # Update successful, save state
+                    self._save_state()
+                except Exception as e:
+                     QMessageBox.critical(self, "Edit Error", f"Failed to apply changes: {e}")
+                     # Attempt to restore original data if update failed
+                     if isinstance(target_obj, Poly): target_obj.points = original_data.points
+                     elif isinstance(target_obj, Ellipse): target_obj.rect = original_data.rect
+                     self._redraw_scene() # Redraw to show restored state
+
 
     def can_paste(self):
         """Checks if the clipboard contains pastable shape data."""
         try:
             data = json.loads(QApplication.clipboard().text())
-            return "layout_editor_clipboard" in data
-        except (json.JSONDecodeError, TypeError):
+            return "layout_editor_clipboard" in data and isinstance(data["layout_editor_clipboard"], list)
+        except (json.JSONDecodeError, TypeError, KeyError):
             return False
 
     def get_selection_bounds_and_center(self):
         """Calculates the bounding box and center of the current selection."""
-        if not self.scene.selectedItems(): return QRectF(), QPointF()
+        selected = self.scene.selectedItems()
+        if not selected: return QRectF(), QPointF()
         bounds = QRectF()
-        for item in self.scene.selectedItems():
-            bounds = bounds.united(item.sceneBoundingRect())
+        first = True
+        for item in selected:
+            item_bounds = item.sceneBoundingRect()
+            if first:
+                 bounds = item_bounds
+                 first = False
+            else:
+                 bounds = bounds.united(item_bounds)
         return bounds, bounds.center()
+
 
     def _transform_shapes(self, transform_func):
         """Generic handler for transformations (rotate, scale, flip)."""
         if not self.project or not self.scene.selectedItems(): return
-        
+
         active_cell = self.project.cells[self.active_cell_name]
         items_to_transform = self.scene.selectedItems()
-        
+
         # Convert any selected ellipses to polygons for robust transformation
         new_polys_from_ellipses = []
-        for item in items_to_transform:
-            if isinstance(item, CircleItem):
-                ellipse_obj = item.data_obj
-                r = item.rect()
-                # Use gdstk for a good circular approximation
-                gds_ellipse = gdstk.ellipse((r.center().x(), r.center().y()), (r.width() / 2, r.height() / 2))
-                new_poly = Poly(layer=ellipse_obj.layer, name=ellipse_obj.name, points=gds_ellipse.points.tolist())
-                new_polys_from_ellipses.append(new_poly)
-                # Remove old ellipse
-                active_cell.ellipses = [e for e in active_cell.ellipses if e.uuid != ellipse_obj.uuid]
-        
+        ellipses_to_remove_uuids = set()
+        if gdstk: # Only convert if gdstk is available
+            for item in items_to_transform:
+                if isinstance(item, CircleItem):
+                    ellipse_obj = item.data_obj
+                    r = item.rect()
+                    try:
+                        # Use gdstk for a good circular approximation
+                        gds_ellipse_cell = gdstk.ellipse((r.center().x(), r.center().y()), (r.width() / 2, r.height() / 2))
+                        for poly in gds_ellipse_cell.polygons:
+                            new_poly = Poly(layer=ellipse_obj.layer, name=ellipse_obj.name, points=poly.points.tolist())
+                            new_polys_from_ellipses.append(new_poly)
+                        ellipses_to_remove_uuids.add(ellipse_obj.uuid)
+                    except Exception as e:
+                         print(f"Warning: Could not convert ellipse to polygon: {e}")
+
         if new_polys_from_ellipses:
-            active_cell.polygons.extend(new_polys_from_ellipses)
-            # Redraw scene to get new PolyItems, then re-select them for transformation
-            self._redraw_scene()
-            all_items = self.scene.items()
-            for item in all_items:
-                if hasattr(item, 'data_obj') and item.data_obj in new_polys_from_ellipses:
-                    item.setSelected(True)
-        
-        transform_func() # Apply the actual transformation
+             # Remove old ellipses first
+             active_cell.ellipses = [e for e in active_cell.ellipses if e.uuid not in ellipses_to_remove_uuids]
+             active_cell.polygons.extend(new_polys_from_ellipses)
+             # Redraw scene to get new PolyItems, then re-select them for transformation
+             self._redraw_scene()
+             all_items = self.scene.items()
+             self.scene.clearSelection() # Clear old selection
+             for scene_item in all_items:
+                # Check data_obj and also check if it's one of the *newly created* polys
+                if hasattr(scene_item, 'data_obj') and any(scene_item.data_obj is p for p in new_polys_from_ellipses):
+                     scene_item.setSelected(True)
+
+
+        # Apply the actual transformation logic
+        transform_func() # This function modifies the data_obj/ref attributes
+
         self._save_state()
-        self._redraw_scene()
+        self._redraw_scene() # Redraw scene from the modified data
 
     def rotate_selection(self):
         angle, ok = QInputDialog.getDouble(self, "Rotate Selection", "Angle (degrees):", 0, -360, 360, 1)
         if not ok: return
-        
+
         def do_rotate():
             _, center = self.get_selection_bounds_and_center()
             transform = QTransform().translate(center.x(), center.y()).rotate(angle).translate(-center.x(), -center.y())
-            
+
             for item in self.scene.selectedItems():
+                # Handle Polygons (including converted Rects and Ellipses)
                 if hasattr(item, 'data_obj') and isinstance(item.data_obj, Poly):
-                    # Get the shape as a QPolygonF regardless of item type
+                    # Get the shape as a QPolygonF regardless of item type (PolyItem or RectItem)
                     if isinstance(item, PolyItem):
                         poly = item.polygon()
                     elif isinstance(item, RectItem):
-                        poly = QPolygonF(item.rect())
-                    else:
-                        continue # Skip other item types
-                        
+                         # Convert rect to polygon for rotation
+                        r = item.rect()
+                        poly = QPolygonF([r.topLeft(), r.topRight(), r.bottomRight(), r.bottomLeft()])
+                    else: continue
+
                     new_poly = transform.map(poly)
                     item.data_obj.points = [(p.x(), p.y()) for p in new_poly]
-        
-        self._transform_shapes(do_rotate)
+
+                # Handle Refs separately
+                elif isinstance(item, RefItem):
+                     # Rotate ref origin around selection center
+                     ref_origin = QPointF(*item.ref.origin)
+                     new_origin = transform.map(ref_origin)
+                     item.ref.origin = (new_origin.x(), new_origin.y())
+                     # Add rotation angle
+                     item.ref.rotation = (item.ref.rotation + angle) % 360.0
+
+
+        self._transform_shapes(do_rotate) # Use the wrapper
 
     def scale_selection(self):
         factor, ok = QInputDialog.getDouble(self, "Scale Selection", "Scale Factor:", 1.0, 0.01, 100.0, 2)
@@ -2449,59 +3412,88 @@ class MainWindow(QMainWindow):
         def do_scale():
             _, center = self.get_selection_bounds_and_center()
             transform = QTransform().translate(center.x(), center.y()).scale(factor, factor).translate(-center.x(), -center.y())
-            
+
             for item in self.scene.selectedItems():
+                # Handle Polygons
                 if hasattr(item, 'data_obj') and isinstance(item.data_obj, Poly):
-                    # Get the shape as a QPolygonF regardless of item type
                     if isinstance(item, PolyItem):
                         poly = item.polygon()
                     elif isinstance(item, RectItem):
-                        poly = QPolygonF(item.rect())
-                    else:
-                        continue # Skip other item types
+                        r = item.rect()
+                        poly = QPolygonF([r.topLeft(), r.topRight(), r.bottomRight(), r.bottomLeft()])
+                    else: continue
 
                     new_poly = transform.map(poly)
                     item.data_obj.points = [(p.x(), p.y()) for p in new_poly]
-        
-        self._transform_shapes(do_scale)
+
+                # Handle Refs separately
+                elif isinstance(item, RefItem):
+                     ref_origin = QPointF(*item.ref.origin)
+                     new_origin = transform.map(ref_origin)
+                     item.ref.origin = (new_origin.x(), new_origin.y())
+                     item.ref.magnification *= factor
+
+
+        self._transform_shapes(do_scale) # Use the wrapper
 
     def flip_selection_horizontal(self):
         def do_flip():
             _, center = self.get_selection_bounds_and_center()
             transform = QTransform().translate(center.x(), 0).scale(-1, 1).translate(-center.x(), 0)
-            
+
             for item in self.scene.selectedItems():
+                 # Handle Polygons
                 if hasattr(item, 'data_obj') and isinstance(item.data_obj, Poly):
-                    # Get the shape as a QPolygonF regardless of item type
                     if isinstance(item, PolyItem):
                         poly = item.polygon()
                     elif isinstance(item, RectItem):
-                        poly = QPolygonF(item.rect())
-                    else:
-                        continue # Skip other item types
-                        
+                        r = item.rect()
+                        poly = QPolygonF([r.topLeft(), r.topRight(), r.bottomRight(), r.bottomLeft()])
+                    else: continue
+
                     new_poly = transform.map(poly)
-                    item.data_obj.points = [(p.x(), p.y()) for p in new_poly]
+                    # Reverse point order for correct winding after flip if needed (gdstk handles this internally)
+                    item.data_obj.points = [(p.x(), p.y()) for p in new_poly] #[::-1]
+
+                 # Handle Refs separately
+                elif isinstance(item, RefItem):
+                     ref_origin = QPointF(*item.ref.origin)
+                     new_origin = transform.map(ref_origin)
+                     item.ref.origin = (new_origin.x(), new_origin.y())
+                     item.ref.rotation = -item.ref.rotation % 360.0 # Flip rotation angle
+                     # Need to handle magnification flip if x_reflection is supported by Ref
+
+
         self._transform_shapes(do_flip)
-        
+
     def flip_selection_vertical(self):
         def do_flip():
             _, center = self.get_selection_bounds_and_center()
             transform = QTransform().translate(0, center.y()).scale(1, -1).translate(0, -center.y())
-            
+
             for item in self.scene.selectedItems():
+                 # Handle Polygons
                 if hasattr(item, 'data_obj') and isinstance(item.data_obj, Poly):
-                    # Get the shape as a QPolygonF regardless of item type
                     if isinstance(item, PolyItem):
                         poly = item.polygon()
                     elif isinstance(item, RectItem):
-                        poly = QPolygonF(item.rect())
-                    else:
-                        continue # Skip other item types
-                        
+                        r = item.rect()
+                        poly = QPolygonF([r.topLeft(), r.topRight(), r.bottomRight(), r.bottomLeft()])
+                    else: continue
+
                     new_poly = transform.map(poly)
-                    item.data_obj.points = [(p.x(), p.y()) for p in new_poly]
+                    item.data_obj.points = [(p.x(), p.y()) for p in new_poly] #[::-1]
+
+                 # Handle Refs separately
+                elif isinstance(item, RefItem):
+                     ref_origin = QPointF(*item.ref.origin)
+                     new_origin = transform.map(ref_origin)
+                     item.ref.origin = (new_origin.x(), new_origin.y())
+                     item.ref.rotation = (180.0 - item.ref.rotation) % 360.0 # Flip rotation angle
+
+
         self._transform_shapes(do_flip)
+
 
     def flip_selection(self):
         menu = QMenu(self)
@@ -2509,7 +3501,7 @@ class MainWindow(QMainWindow):
         horiz.triggered.connect(self.flip_selection_horizontal)
         vert = menu.addAction("Flip Vertical")
         vert.triggered.connect(self.flip_selection_vertical)
-        menu.exec_(self.cursor().pos())
+        menu.exec_(QCursor.pos()) # Use global cursor pos
 
     def arrange_selection(self):
         menu = QMenu(self)
@@ -2517,56 +3509,72 @@ class MainWindow(QMainWindow):
         front.triggered.connect(self.bring_selection_to_front)
         back = menu.addAction("Send to Back")
         back.triggered.connect(self.send_selection_to_back)
-        menu.exec_(self.cursor().pos())
+        menu.exec_(QCursor.pos()) # Use global cursor pos
 
     def move_selection_forward(self):
         if not (cell := self.project.cells.get(self.active_cell_name)) or not self.scene.selectedItems(): return
         selected_data = {item.data_obj for item in self.scene.selectedItems() if hasattr(item, 'data_obj')}
-        
+        if not selected_data: return
+
         # Move polygons forward
-        for i in range(len(cell.polygons) - 2, -1, -1):
-            if cell.polygons[i] in selected_data and cell.polygons[i+1] not in selected_data:
-                cell.polygons[i], cell.polygons[i+1] = cell.polygons[i+1], cell.polygons[i]
+        moved = False
+        poly_list = cell.polygons
+        for i in range(len(poly_list) - 2, -1, -1):
+            if poly_list[i] in selected_data and poly_list[i+1] not in selected_data:
+                poly_list[i], poly_list[i+1] = poly_list[i+1], poly_list[i]
+                moved = True
 
         # Move ellipses forward
-        for i in range(len(cell.ellipses) - 2, -1, -1):
-            if cell.ellipses[i] in selected_data and cell.ellipses[i+1] not in selected_data:
-                cell.ellipses[i], cell.ellipses[i+1] = cell.ellipses[i+1], cell.ellipses[i]
-
-        self._save_state(); self._redraw_scene()
+        ellipse_list = cell.ellipses
+        for i in range(len(ellipse_list) - 2, -1, -1):
+            if ellipse_list[i] in selected_data and ellipse_list[i+1] not in selected_data:
+                ellipse_list[i], ellipse_list[i+1] = ellipse_list[i+1], ellipse_list[i]
+                moved = True
+        
+        # Note: Doesn't move Refs
+        
+        if moved: self._save_state(); self._redraw_scene()
 
     def move_selection_backward(self):
         if not (cell := self.project.cells.get(self.active_cell_name)) or not self.scene.selectedItems(): return
         selected_data = {item.data_obj for item in self.scene.selectedItems() if hasattr(item, 'data_obj')}
+        if not selected_data: return
 
+        moved = False
         # Move polygons backward
-        for i in range(1, len(cell.polygons)):
-            if cell.polygons[i] in selected_data and cell.polygons[i-1] not in selected_data:
-                cell.polygons[i], cell.polygons[i-1] = cell.polygons[i-1], cell.polygons[i]
-        
-        # Move ellipses backward
-        for i in range(1, len(cell.ellipses)):
-            if cell.ellipses[i] in selected_data and cell.ellipses[i-1] not in selected_data:
-                cell.ellipses[i], cell.ellipses[i-1] = cell.ellipses[i-1], cell.ellipses[i]
+        poly_list = cell.polygons
+        for i in range(1, len(poly_list)):
+            if poly_list[i] in selected_data and poly_list[i-1] not in selected_data:
+                poly_list[i], poly_list[i-1] = poly_list[i-1], poly_list[i]
+                moved = True
 
-        self._save_state(); self._redraw_scene()
+        # Move ellipses backward
+        ellipse_list = cell.ellipses
+        for i in range(1, len(ellipse_list)):
+            if ellipse_list[i] in selected_data and ellipse_list[i-1] not in selected_data:
+                ellipse_list[i], ellipse_list[i-1] = ellipse_list[i-1], ellipse_list[i]
+                moved = True
+
+        if moved: self._save_state(); self._redraw_scene()
 
     def bring_selection_to_front(self):
         if not (cell := self.project.cells.get(self.active_cell_name)) or not self.scene.selectedItems(): return
         selected_data = {item.data_obj for item in self.scene.selectedItems() if hasattr(item, 'data_obj')}
-        
+        if not selected_data: return
+
         polys_to_move = [p for p in cell.polygons if p in selected_data]
         ellipses_to_move = [e for e in cell.ellipses if e in selected_data]
-        
+
         cell.polygons = [p for p in cell.polygons if p not in selected_data] + polys_to_move
         cell.ellipses = [e for e in cell.ellipses if e not in selected_data] + ellipses_to_move
-        
+
         self._save_state(); self._redraw_scene()
 
     def send_selection_to_back(self):
         if not (cell := self.project.cells.get(self.active_cell_name)) or not self.scene.selectedItems(): return
         selected_data = {item.data_obj for item in self.scene.selectedItems() if hasattr(item, 'data_obj')}
-        
+        if not selected_data: return
+
         polys_to_move = [p for p in cell.polygons if p in selected_data]
         ellipses_to_move = [e for e in cell.ellipses if e in selected_data]
 
@@ -2574,46 +3582,55 @@ class MainWindow(QMainWindow):
         cell.ellipses = ellipses_to_move + [e for e in cell.ellipses if e not in selected_data]
 
         self._save_state(); self._redraw_scene()
-        
+
     def move_selection_to_layer(self, layer_name):
-        if not self.scene.selectedItems(): return
-        for item in self.scene.selectedItems():
-            if hasattr(item, 'data_obj'):
+        selected = self.scene.selectedItems()
+        if not selected: return
+        target_layer = self.project.layer_by_name.get(layer_name)
+        if not target_layer: return # Target layer doesn't exist
+
+        changed = False
+        for item in selected:
+            if hasattr(item, 'data_obj') and item.data_obj.layer != layer_name:
                 item.data_obj.layer = layer_name
-        self._save_state(); self._redraw_scene()
+                changed = True
+
+        if changed: self._save_state(); self._redraw_scene()
 
     def measure_selection(self):
-        if not self.scene.selectedItems() or not gdstk: return
-        
+        selected = self.scene.selectedItems()
+        if not selected or not gdstk: return
+
         total_area, total_perimeter = 0.0, 0.0
-        
-        for item in self.scene.selectedItems():
+
+        for item in selected:
             try:
+                gds_shape = None
                 if isinstance(item, PolyItem):
-                    # For polygons, get points from the polygon() method
-                    gds_poly = gdstk.Polygon([(p.x(), p.y()) for p in item.polygon()])
-                    total_area += gds_poly.area()
-                    total_perimeter += gds_poly.perimeter()
+                    gds_shape = gdstk.Polygon([(p.x(), p.y()) for p in item.polygon()])
                 elif isinstance(item, RectItem):
-                    # For rectangles, get the rect() and define its four corner points
                     r = item.rect()
                     pts = [(r.left(), r.top()), (r.right(), r.top()), (r.right(), r.bottom()), (r.left(), r.bottom())]
-                    gds_poly = gdstk.Polygon(pts)
-                    total_area += gds_poly.area()
-                    total_perimeter += gds_poly.perimeter()
+                    gds_shape = gdstk.Polygon(pts)
                 elif isinstance(item, CircleItem):
                     r = item.rect()
-                    gds_ellipse = gdstk.ellipse((r.center().x(), r.center().y()), (r.width() / 2, r.height() / 2))
-                    total_area += gds_ellipse.area()
-                    total_perimeter += gds_ellipse.perimeter()
+                    # gdstk.ellipse returns a Cell, get polygon from it
+                    temp_cell = gdstk.ellipse((r.center().x(), r.center().y()), (r.width() / 2, r.height() / 2))
+                    if temp_cell.polygons:
+                         gds_shape = temp_cell.polygons[0] # Assume first polygon is representative for area/perimeter
+
+                if gds_shape:
+                     total_area += gds_shape.area()
+                     total_perimeter += gds_shape.perimeter()
+
             except Exception as e:
                 print(f"Warning: Measurement failed for an item. {e}")
-        
+
         QMessageBox.information(self, "Measurement",
-            f"Selected items: {len(self.scene.selectedItems())}\n"
-            f"Total Area: {total_area:.2f} sq. units\n"
-            f"Total Perimeter: {total_perimeter:.2f} units")
-    
+            f"Selected items: {len(selected)}\n"
+            f"Total Area: {total_area:.3f} sq. {self.project.units}\n"
+            f"Total Perimeter: {total_perimeter:.3f} {self.project.units}")
+
 # -------------------------- main --------------------------
 def main():
     app = QApplication(sys.argv)
@@ -2639,7 +3656,19 @@ class ProjectEncoder(json.JSONEncoder):
     def default(self, o):
         if isinstance(o, UUID): return str(o)
         if is_dataclass(o): return asdict(o)
+        # Handle numpy types
+        if _has_level_set_deps:
+            if isinstance(o, (np.int_, np.intc, np.intp, np.int8, np.int16, np.int32, np.int64, np.uint8,
+                               np.uint16, np.uint32, np.uint64)):
+                return int(o)
+            elif isinstance(o, (np.float_, np.float16, np.float32, np.float64)):
+                return float(o)
+            elif isinstance(o, (np.ndarray,)):
+                return o.tolist()
+            elif isinstance(o, np.bool_):
+                 return bool(o)
         return super().default(o)
+
 
 if __name__ == "__main__":
     main()
