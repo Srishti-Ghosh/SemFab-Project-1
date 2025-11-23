@@ -8,6 +8,9 @@ import skimage
 from dataclasses import dataclass, asdict, field, is_dataclass
 from typing import Dict, List, Tuple, Optional
 from uuid import UUID
+from skimage import measure
+from scipy.ndimage import gaussian_filter
+
 # --- 3D Dependencies ---
 try:
     import pyqtgraph.opengl as gl
@@ -1449,7 +1452,6 @@ class SimulationWorker(QThread):
             self.error_occurred.emit(str(e))
 
 
-# --- 2. The Main View Dialog ---
 class ThreeDViewDialog(QDialog):
     def __init__(self, project, parent=None):
         super().__init__(parent)
@@ -1457,29 +1459,29 @@ class ThreeDViewDialog(QDialog):
         self.resize(1400, 900)
         self.project = project
         self.worker = None
-        self.generated_meshes = [] # Store references to meshes for live updates
+        self.generated_meshes = []  # Store references to meshes for live updates
         self.current_z_scale = 1.0
 
         # --- Layouts ---
-        main_layout = QHBoxLayout(self) # Side-by-side layout
-        
+        main_layout = QHBoxLayout(self)  # Side-by-side layout
+
         # 1. Left Side: The 3D Viewport
         if _has_3d_deps:
             self.gl_view = gl.GLViewWidget()
-            self.gl_view.opts['distance'] = 200 # Initial camera distance
+            self.gl_view.opts['distance'] = 200  # Initial camera distance
             self.gl_view.opts['azimuth'] = -45
             self.gl_view.opts['elevation'] = 30
-            self.gl_view.setBackgroundColor('#1e1e1e') # Dark Gray vs Pitch Black
-            
+            self.gl_view.setBackgroundColor('#1e1e1e')  # Dark Gray vs Pitch Black
+
             # Grid and Axis
             self.grid_item = gl.GLGridItem()
             self.grid_item.scale(20, 20, 1)
             self.gl_view.addItem(self.grid_item)
-            
+
             self.axis_item = gl.GLAxisItem()
             self.axis_item.setSize(50, 50, 50)
             self.gl_view.addItem(self.axis_item)
-            
+
             main_layout.addWidget(self.gl_view, stretch=4)
         else:
             main_layout.addWidget(QLabel("Error: Missing pyqtgraph/skimage"))
@@ -1496,38 +1498,52 @@ class ThreeDViewDialog(QDialog):
         self.lbl_status = QLabel("Ready to build.")
         self.lbl_status.setStyleSheet("color: gray; font-style: italic;")
         panel_layout.addWidget(self.lbl_status)
-        
+
         self.progress = QProgressBar()
         self.progress.setTextVisible(False)
         self.progress.setVisible(False)
         panel_layout.addWidget(self.progress)
-        
-        btn_run = QPushButton("Generate 3D Model")
-        btn_run.setStyleSheet("background-color: #007ACC; color: white; font-weight: bold; padding: 8px;")
-        btn_run.clicked.connect(self.start_simulation)
-        panel_layout.addWidget(btn_run)
+
+        # Store as attribute so we can enable/disable it
+        self.btn_run = QPushButton("Generate 3D Model")
+        self.btn_run.setStyleSheet(
+            "background-color: #007ACC; color: white; font-weight: bold; padding: 8px;"
+        )
+        self.btn_run.clicked.connect(self.start_simulation)
+        panel_layout.addWidget(self.btn_run)
+
+        # NEW: Reset button
+        self.btn_reset = QPushButton("Reset 3D View")
+        self.btn_reset.clicked.connect(self.reset_view)
+        panel_layout.addWidget(self.btn_reset)
 
         panel_layout.addWidget(self._create_separator())
 
         # -- Section: Camera & View --
         panel_layout.addWidget(QLabel("<b>2. Camera Presets</b>"))
         cam_grid = QGridLayout()
-        btn_iso = QPushButton("ISO"); btn_iso.clicked.connect(lambda: self.set_cam(-45, 30))
-        btn_top = QPushButton("TOP"); btn_top.clicked.connect(lambda: self.set_cam(0, 90))
-        btn_front = QPushButton("FRONT"); btn_front.clicked.connect(lambda: self.set_cam(-90, 0))
-        btn_side = QPushButton("SIDE"); btn_side.clicked.connect(lambda: self.set_cam(0, 0))
-        cam_grid.addWidget(btn_iso, 0, 0); cam_grid.addWidget(btn_top, 0, 1)
-        cam_grid.addWidget(btn_front, 1, 0); cam_grid.addWidget(btn_side, 1, 1)
+        btn_iso = QPushButton("ISO")
+        btn_iso.clicked.connect(lambda: self.set_cam(-45, 30))
+        btn_top = QPushButton("TOP")
+        btn_top.clicked.connect(lambda: self.set_cam(0, 90))
+        btn_front = QPushButton("FRONT")
+        btn_front.clicked.connect(lambda: self.set_cam(-90, 0))
+        btn_side = QPushButton("SIDE")
+        btn_side.clicked.connect(lambda: self.set_cam(0, 0))
+        cam_grid.addWidget(btn_iso, 0, 0)
+        cam_grid.addWidget(btn_top, 0, 1)
+        cam_grid.addWidget(btn_front, 1, 0)
+        cam_grid.addWidget(btn_side, 1, 1)
         panel_layout.addLayout(cam_grid)
 
         # -- Section: Appearance --
         panel_layout.addWidget(QLabel("<b>3. Appearance</b>"))
-        
+
         # Z-Scale Slider
         panel_layout.addWidget(QLabel("Z-Axis Exaggeration:"))
         self.slider_z = QSlider(Qt.Horizontal)
-        self.slider_z.setRange(1, 200) # 0.1x to 20.0x
-        self.slider_z.setValue(20) # Default 2.0x
+        self.slider_z.setRange(1, 200)  # 0.1x to 20.0x
+        self.slider_z.setValue(20)      # Default 2.0x
         self.slider_z.valueChanged.connect(self.update_z_scale)
         panel_layout.addWidget(self.slider_z)
 
@@ -1555,9 +1571,14 @@ class ThreeDViewDialog(QDialog):
 
         # Materials colors
         self.colors = [
-            (0,0,0,0), (0.6,0.6,0.6,1), (0.2,0.4,0.8,0.6), 
-            (0.8,0.2,0.2,0.6), (0.2,0.8,0.2,0.6), (0.9,0.9,0.2,0.7)
+            (0, 0, 0, 0),
+            (0.6, 0.6, 0.6, 1),
+            (0.2, 0.4, 0.8, 0.6),
+            (0.8, 0.2, 0.2, 0.6),
+            (0.2, 0.8, 0.2, 0.6),
+            (0.9, 0.9, 0.2, 0.7),
         ]
+
 
     def _create_separator(self):
         line = QFrame()
@@ -1573,13 +1594,32 @@ class ThreeDViewDialog(QDialog):
         self.axis_item.setVisible(visible)
 
     def toggle_transparency(self, checked):
-        # We need to re-add items to change glOptions in pyqtgraph
-        # But for simple opacity update, we can tweak colors
-        alpha = 0.6 if checked else 1.0
+        """
+        Toggle between translucent and solid (opaque) materials.
+
+        When checked  -> use original alpha and 'translucent' blending.
+        When unchecked -> force alpha = 1.0 and use 'opaque' blending.
+        """
+        if not hasattr(self, "generated_meshes") or not self.generated_meshes:
+            return
+
         for mesh_item in self.generated_meshes:
-            c = mesh_item.color
-            # Update alpha channel
-            mesh_item.setColor((c[0], c[1], c[2], alpha))
+            # Base color was stored when meshes were created
+            base = getattr(mesh_item, "_base_color", (1.0, 1.0, 1.0, 1.0))
+            r, g, b, a = base
+
+            if checked:
+                # Translucent view: use original alpha and translucent blending
+                mesh_item.setGLOptions("translucent")
+                mesh_item.setColor((r, g, b, a))
+            else:
+                # Solid view: alpha = 1 and opaque blending
+                mesh_item.setGLOptions("opaque")
+                mesh_item.setColor((r, g, b, 1.0))
+
+        if hasattr(self, "gl_view"):
+            self.gl_view.update()
+
 
     def update_z_scale(self):
         # Convert slider 1-200 to float 0.1-20.0
@@ -1601,91 +1641,220 @@ class ThreeDViewDialog(QDialog):
             self.gl_view.grabFrameBuffer().save(path)
 
     def start_simulation(self):
+        # Show progress bar + reset it
         self.progress.setVisible(True)
         self.progress.setValue(0)
-        
+        self.lbl_status.setText("Running 3D process simulation...")
+
+        # Disable the run button while simulation is in progress
+        if hasattr(self, "btn_run"):
+            self.btn_run.setEnabled(False)
+
+        # Stop any previous worker if it is still running
+        if self.worker is not None and self.worker.isRunning():
+            try:
+                self.worker.terminate()
+                self.worker.wait()
+            except Exception:
+                pass
+        self.worker = None
+
         # Clear old meshes
         for m in self.generated_meshes:
-            self.gl_view.removeItem(m)
+            try:
+                self.gl_view.removeItem(m)
+            except Exception:
+                pass
         self.generated_meshes.clear()
 
         # Start Worker
-        self.worker = SimulationWorker(self.project, self.project.canvas_width, self.project.canvas_height)
+        self.worker = SimulationWorker(
+            self.project, self.project.canvas_width, self.project.canvas_height
+        )
         self.worker.progress_update.connect(self.on_progress)
         self.worker.finished_data.connect(self.on_finished)
         self.worker.error_occurred.connect(self.on_error)
         self.worker.start()
+
 
     def on_progress(self, percent, message):
         self.progress.setValue(percent)
         self.lbl_status.setText(message)
 
     def on_error(self, msg):
+        # Called from the worker thread when something goes wrong
+        self.worker = None
         self.lbl_status.setText("Error!")
         QMessageBox.critical(self, "Simulation Error", msg)
         self.progress.setVisible(False)
 
+        # Re-enable the run button so user can try again
+        if hasattr(self, "btn_run"):
+            self.btn_run.setEnabled(True)
+
+    def reset_view(self):
+        """
+        Completely reset 3D view, state, and UI so previous runs/errors
+        don't carry over.
+        """
+
+        # Stop any running worker safely
+        if self.worker is not None and self.worker.isRunning():
+            try:
+                self.worker.terminate()
+                self.worker.wait()
+            except Exception:
+                pass
+        self.worker = None
+
+        # Remove all generated meshes from the GL view
+        if hasattr(self, "gl_view"):
+            for m in self.generated_meshes:
+                try:
+                    self.gl_view.removeItem(m)
+                except Exception:
+                    pass
+        self.generated_meshes.clear()
+
+        # Reset camera to default
+        if hasattr(self, "gl_view"):
+            self.gl_view.opts["distance"] = 200
+            self.gl_view.opts["azimuth"] = -45
+            self.gl_view.opts["elevation"] = 30
+            self.gl_view.update()
+
+        # Reset Z-scale (back to default slider value)
+        self.current_z_scale = 1.0
+        if hasattr(self, "slider_z"):
+            self.slider_z.blockSignals(True)
+            self.slider_z.setValue(20)  # same as initial value in __init__
+            self.slider_z.blockSignals(False)
+            # No need to call update_z_scale() because there are no meshes yet
+
+        # Make sure grid / axis and translucency are back on
+        if hasattr(self, "grid_item"):
+            self.grid_item.setVisible(True)
+        if hasattr(self, "axis_item"):
+            self.axis_item.setVisible(True)
+        if hasattr(self, "chk_translucent"):
+            self.chk_translucent.setChecked(True)
+
+        # Reset status/progress text
+        self.progress.setVisible(False)
+        self.progress.setValue(0)
+        self.lbl_status.setText("Ready to build.")
+
+        # Ensure Run button is usable again
+        if hasattr(self, "btn_run"):
+            self.btn_run.setEnabled(True)
+    
     def on_finished(self, volume, res, offset):
-        self.lbl_status.setText("Rendering...")
+        """
+        Called when the SimulationWorker finishes.
+
+        volume : 3D numpy array of material IDs
+        res    : in-plane resolution (x/y step in world units)
+        offset : (min_x, min_y) real-world origin for this cropped volume
+        """
+        self.lbl_status.setText("Rendering 3D model...")
         QApplication.processEvents()
-        
+
         min_x, min_y = offset
-        
+
         try:
             unique_mats = np.unique(volume)
-            
-            # Calculate center of the model for camera focus
-            center_x = min_x + (volume.shape[0] * res) / 2
-            center_y = min_y + (volume.shape[1] * res) / 2
-            
+
+            # Compute center of model in world coordinates for nicer centering
+            size_x = volume.shape[0] * res
+            size_y = volume.shape[1] * res
+            center_x = min_x + size_x / 2.0
+            center_y = min_y + size_y / 2.0
+
+            # Remove any old meshes just in case
+            if hasattr(self, "generated_meshes"):
+                for m in self.generated_meshes:
+                    try:
+                        self.gl_view.removeItem(m)
+                    except Exception:
+                        pass
+                self.generated_meshes.clear()
+            else:
+                self.generated_meshes = []
+
             for mid in unique_mats:
-                if mid == 0: continue
-                
-                # Isolate material
+                if mid == 0:
+                    continue  # 0 = empty
+
+                # 1) Isolate this material as a float volume
                 mat_vol = (volume == mid).astype(float)
-                
-                # Smooth
-                from scipy.ndimage import gaussian_filter
-                mat_vol = gaussian_filter(mat_vol, sigma=0.5) 
-                
-                # Marching Cubes (Mac-Safe)
+
+                # 2) Slight smoothing before marching cubes
+                mat_vol = gaussian_filter(mat_vol, sigma=0.5)
+
+                # 3) Marching Cubes
                 verts, faces, normals, _ = measure.marching_cubes(mat_vol, level=0.5)
-                
-                # --- Coordinate Mapping Fix ---
-                # 1. Scale voxels to world units
-                verts[:, 0] *= res
-                verts[:, 1] *= res
-                verts[:, 2] *= 1.0 # Z scale (voxels are approx 1 unit high)
-                
-                # 2. Translate to actual position (add the crop offset)
-                verts[:, 0] += min_x
-                verts[:, 1] += min_y
-                
-                # 3. Center it in the view (Move everything so center is at 0,0,0)
+
+                # 4) Convert from voxel coords to world coords
+                #    x -> i * res + min_x, y -> j * res + min_y, z -> k * (res or 1)
+                verts[:, 0] = verts[:, 0] * res + min_x
+                verts[:, 1] = verts[:, 1] * res + min_y
+                verts[:, 2] = verts[:, 2] * res  # or 1.0 if your z spacing differs
+
+                # 5) Center model around origin for nicer camera handling
                 verts[:, 0] -= center_x
                 verts[:, 1] -= center_y
-                
-                # Create Mesh
-                mesh = gl.GLMeshItem(vertexes=verts, 
-                                     faces=faces, 
-                                     normals=normals, 
-                                     color=self.colors[mid % len(self.colors)],
-                                     smooth=True, 
-                                     glOptions='translucent')
-                
+
+                # Pick a color for this material
+                base_color = self.colors[mid % len(self.colors)]
+
+                # Decide initial glOptions based on checkbox state
+                if self.chk_translucent.isChecked():
+                    gl_opts = "translucent"
+                else:
+                    gl_opts = "opaque"
+                    # If solid mode, force alpha to 1
+                    if len(base_color) == 4:
+                        base_color = (base_color[0], base_color[1],
+                                      base_color[2], 1.0)
+
+                # 6) Create GLMeshItem
+                mesh = gl.GLMeshItem(
+                    vertexes=verts,
+                    faces=faces,
+                    normals=normals,
+                    color=base_color,
+                    smooth=True,
+                    glOptions=gl_opts,
+                )
+
+                # Store base color so toggle_transparency can restore it
+                mesh._base_color = base_color
+
+                # Add to scene and track it
                 self.gl_view.addItem(mesh)
                 self.generated_meshes.append(mesh)
 
-            self.update_z_scale()
+            # Apply current Z scale to the new meshes (if you have that logic)
+            if hasattr(self, "update_z_scale"):
+                self.update_z_scale()
+
             self.lbl_status.setText("Done.")
-            
         except Exception as e:
             import traceback
             traceback.print_exc()
             self.lbl_status.setText("Render Failed.")
-            
+            QMessageBox.critical(self, "Render Error", str(e))
+
+        # Worker finished; clean up
+        self.worker = None
         self.progress.setVisible(False)
-        self.btn_run.setEnabled(True)
+
+        # Re-enable Run button
+        if hasattr(self, "btn_run"):
+            self.btn_run.setEnabled(True)
+
+
+    
 
 # -------------------------- Main window --------------------------
 
