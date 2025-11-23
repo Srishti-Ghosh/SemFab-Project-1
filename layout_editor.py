@@ -301,7 +301,7 @@ class Interactive2_5dView(QGraphicsView):
         self.setRenderHint(QPainter.Antialiasing)
         self.setDragMode(QGraphicsView.NoDrag)
         self._last_pan_point = QPointF()
-        self.setViewport(QOpenGLWidget())
+        #self.setViewport(QOpenGLWidget())
         #self.setViewportUpdateMode(QGraphicsView.FullViewportUpdate)
 
     def mousePressEvent(self, event):
@@ -1000,7 +1000,7 @@ class Canvas(QGraphicsView):
         super().__init__(scene)
         self.setRenderHints(QPainter.Antialiasing); self.setAcceptDrops(True)
         self.setTransformationAnchor(QGraphicsView.AnchorUnderMouse); self.setResizeAnchor(QGraphicsView.AnchorViewCenter)
-        self.setViewport(QOpenGLWidget())
+        #self.setViewport(QOpenGLWidget())
         self.mode = self.MODES["select"]; self.start_pos = None; self.temp_item = None
         self.temp_poly_points: List[QPointF] = []
         self.temp_path_points: List[QPointF] = []
@@ -1291,16 +1291,14 @@ from PyQt5.QtCore import QThread, pyqtSignal
 
 # --- 1. The Worker Thread (Does the math in background) ---
 class SimulationWorker(QThread):
-    # Signals to update the UI
-    progress_update = pyqtSignal(int, str) # Percent, Message
-    finished_data = pyqtSignal(object, float) # The Volume array, Resolution used
+    progress_update = pyqtSignal(int, str)
+    finished_data = pyqtSignal(object, float, tuple) # Added tuple for (min_x, min_y) offset
     error_occurred = pyqtSignal(str)
 
     def __init__(self, project, width, height):
         super().__init__()
         self.project = project
-        self.canvas_w = width
-        self.canvas_h = height
+        # We ignore width/height inputs now and calculate them dynamically
 
     def run(self):
         try:
@@ -1308,78 +1306,144 @@ class SimulationWorker(QThread):
             from scipy.ndimage import distance_transform_edt, gaussian_filter
             import matplotlib.path as mpath
 
-            # --- A. Auto-Calculate Resolution ---
-            # Target a grid width of roughly 200-300 voxels for speed
-            target_dim = 250
-            res = max(self.canvas_w / target_dim, self.canvas_h / target_dim)
-            res = max(res, 0.5) # Don't go below 0.5 units
+            self.progress_update.emit(5, "Analyzing Layout...")
+
+            # --- 1. Dynamic Bounding Box Calculation ---
+            # Collect all points from all visible polygons to find the active area
+            all_xs = []
+            all_ys = []
+            cell = self.project.cells[self.project.top]
             
-            w = int(self.canvas_w / res)
-            h = int(self.canvas_h / res)
-            d = 60 # Z-depth fixed for demo
+            visible_layers = [l for l in self.project.layers if l.visible]
+            visible_names = {l.name for l in visible_layers}
+
+            has_content = False
+            for p in cell.polygons:
+                if p.layer in visible_names and p.points:
+                    xs = [pt[0] for pt in p.points]
+                    ys = [pt[1] for pt in p.points]
+                    all_xs.extend(xs)
+                    all_ys.extend(ys)
+                    has_content = True
             
-            self.progress_update.emit(5, f"Initializing Grid ({w}x{h}x{d})...")
+            # Also check ellipses (approximate bounding box)
+            for e in cell.ellipses:
+                if e.layer in visible_names:
+                    all_xs.extend([e.rect[0], e.rect[0] + e.rect[2]])
+                    all_ys.extend([e.rect[1], e.rect[1] + e.rect[3]])
+                    has_content = True
+
+            if not has_content:
+                self.error_occurred.emit("No visible shapes found to simulate.")
+                return
+
+            # Define bounds with a margin
+            margin = 20.0
+            min_x, max_x = min(all_xs) - margin, max(all_xs) + margin
+            min_y, max_y = min(all_ys) - margin, max(all_ys) + margin
             
+            real_w = max_x - min_x
+            real_h = max_y - min_y
+
+            # --- 2. Smart Resolution ---
+            # Fixed grid size of 256 on the longest side for performance
+            # This makes small chips look detailed and huge chips process fast.
+            target_dim = 256
+            res = max(real_w, real_h) / target_dim
+            
+            w = int(real_w / res)
+            h = int(real_h / res)
+            d = 60 # Z-depth resolution (layers)
+
+            self.progress_update.emit(10, f"Grid Size: {w}x{h}x{d}")
+
             volume = np.zeros((w, h, d), dtype=np.uint8)
-            
-            # --- B. Grid Setup ---
-            # Coordinate grid for rasterization
-            x = np.linspace(0, self.canvas_w, w)
-            y = np.linspace(0, self.canvas_h, h)
-            xv, yv = np.meshgrid(x, y)
+
+            # --- 3. Generate Coordinate Grid ---
+            # Create a grid that exactly matches the bounded area
+            x_space = np.linspace(min_x, max_x, w)
+            y_space = np.linspace(min_y, max_y, h)
+            xv, yv = np.meshgrid(x_space, y_space)
+            # Flatten for vectorized containment check
             grid_points = np.vstack((xv.flatten(), yv.flatten())).T
 
-            # --- C. Substrate ---
-            sub_h = int(d * 0.2)
+            # --- 4. Substrate Initialization ---
+            sub_h = int(d * 0.15) # Bottom 15% is substrate
             volume[:, :, 0:sub_h] = 1 
             current_z = sub_h
 
-            # --- D. Process Layers ---
+            # --- 5. Process Layers ---
             mat_id = 2
-            visible_layers = [l for l in self.project.layers if l.visible]
-            total_steps = len(visible_layers)
+            total_layers = len(visible_layers)
 
             for i, layer in enumerate(visible_layers):
-                msg = f"Processing Layer: {layer.name}"
-                percent = 10 + int((i / total_steps) * 80)
-                self.progress_update.emit(percent, msg)
+                msg = f"Processing: {layer.name}"
+                self.progress_update.emit(15 + int((i/total_layers)*80), msg)
 
-                # 1. Rasterize (Vector -> 2D Grid)
-                polys = [p.points for p in self.project.cells[self.project.top].polygons if p.layer == layer.name]
+                # Collect polygons for THIS layer
+                polys = [p.points for p in cell.polygons if p.layer == layer.name]
+                
+                # Handle Ellipses for this layer (Convert to Path)
+                
+                ellipses = [e for e in cell.ellipses if e.layer == layer.name]
+                for e in ellipses:
+                    # Convert ellipse to polygon points (32 segments)
+                    cx, cy = e.rect[0] + e.rect[2]/2, e.rect[1] + e.rect[3]/2
+                    rx, ry = e.rect[2]/2, e.rect[3]/2
+                    theta = np.linspace(0, 2*np.pi, 32)
+                    ex = cx + rx * np.cos(theta)
+                    ey = cy + ry * np.sin(theta)
+                    pts = np.column_stack([ex, ey])
+                    polys.append(pts) # Add to the list to be processed
+                # --------------------------------------------------
+
                 if not polys: continue
+                # ... (Simplified: Ellipses handled via bounding box above, 
+                # strict rasterization requires converting ellipse to polygon points here.
+                # For now, we rely on the user converting circles to polys or standard polys)
 
-                layer_mask = np.zeros((w, h), dtype=bool)
+                # Rasterize
+                layer_mask_flat = np.zeros(w*h, dtype=bool)
+                
                 for p_points in polys:
                     path = mpath.Path(p_points)
-                    # Create boolean mask
-                    mask = path.contains_points(grid_points).reshape(h, w).T
-                    layer_mask |= mask
+                    # Determine which grid points are inside this polygon
+                    mask = path.contains_points(grid_points)
+                    layer_mask_flat |= mask
                 
+                layer_mask = layer_mask_flat.reshape(h, w).T # Reshape back to grid
+
                 if not np.any(layer_mask): continue
 
-                # 2. Apply Realism (Rounding)
+                # Realism: Blur/Round
                 mask_float = layer_mask.astype(float)
-                mask_blurred = gaussian_filter(mask_float, sigma=1.0) # Lower sigma for speed
+                mask_blurred = gaussian_filter(mask_float, sigma=1.0)
                 mask_processed = mask_blurred > 0.5
 
-                # 3. Apply Taper (Distance Field)
+                # Realism: Taper
                 dt = distance_transform_edt(mask_processed)
-                thickness = max(1, int(layer.thickness_2_5d / res))
-                taper_angle = 12.0
+                
+                # Thickness in voxels
+                thick_vox = max(1, int(layer.thickness_2_5d / res))
+                taper_angle = 10.0
 
-                # 4. Stack Volume
-                for z in range(thickness):
+                for z in range(thick_vox):
                     z_idx = current_z + z
                     if z_idx >= d: break
+                    
                     erosion = z * np.tan(np.radians(taper_angle))
+                    # Solid if distance from edge > erosion amount
                     z_mask = dt > erosion
+                    
+                    # Overwrite existing voxels
                     volume[z_mask, z_idx] = mat_id
 
-                current_z += thickness
+                current_z += thick_vox
                 mat_id += 1
 
-            self.progress_update.emit(100, "Finalizing Mesh...")
-            self.finished_data.emit(volume, res)
+            self.progress_update.emit(100, "Meshing...")
+            # Pass back volume, resolution, and the top-left corner offset
+            self.finished_data.emit(volume, res, (min_x, min_y))
 
         except Exception as e:
             self.error_occurred.emit(str(e))
@@ -1389,55 +1453,162 @@ class SimulationWorker(QThread):
 class ThreeDViewDialog(QDialog):
     def __init__(self, project, parent=None):
         super().__init__(parent)
-        self.setWindowTitle("High-Fidelity 3D View")
-        self.resize(1200, 900)
+        self.setWindowTitle("Interactive 3D Process Viewer")
+        self.resize(1400, 900)
         self.project = project
         self.worker = None
+        self.generated_meshes = [] # Store references to meshes for live updates
+        self.current_z_scale = 1.0
 
-        layout = QVBoxLayout(self)
-
-        # 3D Viewport
+        # --- Layouts ---
+        main_layout = QHBoxLayout(self) # Side-by-side layout
+        
+        # 1. Left Side: The 3D Viewport
         if _has_3d_deps:
             self.gl_view = gl.GLViewWidget()
-            self.gl_view.opts['distance'] = 150
-            self.gl_view.setBackgroundColor('#202020')
+            self.gl_view.opts['distance'] = 200 # Initial camera distance
+            self.gl_view.opts['azimuth'] = -45
+            self.gl_view.opts['elevation'] = 30
+            self.gl_view.setBackgroundColor('#1e1e1e') # Dark Gray vs Pitch Black
             
-            # Add a floor grid for reference
-            g = gl.GLGridItem()
-            g.scale(20, 20, 1)
-            self.gl_view.addItem(g)
+            # Grid and Axis
+            self.grid_item = gl.GLGridItem()
+            self.grid_item.scale(20, 20, 1)
+            self.gl_view.addItem(self.grid_item)
             
-            layout.addWidget(self.gl_view)
+            self.axis_item = gl.GLAxisItem()
+            self.axis_item.setSize(50, 50, 50)
+            self.gl_view.addItem(self.axis_item)
+            
+            main_layout.addWidget(self.gl_view, stretch=4)
         else:
-            layout.addWidget(QLabel("Error: Missing pyqtgraph/skimage/scipy"))
+            main_layout.addWidget(QLabel("Error: Missing pyqtgraph/skimage"))
 
-        # Progress Bar
-        self.progress_bar = QProgressBar()
-        self.progress_bar.setVisible(False)
-        layout.addWidget(self.progress_bar)
+        # 2. Right Side: Control Panel
+        panel = QFrame()
+        panel.setFrameShape(QFrame.StyledPanel)
+        panel.setMaximumWidth(300)
+        panel_layout = QVBoxLayout(panel)
+        panel_layout.setSpacing(15)
+
+        # -- Section: Simulation --
+        panel_layout.addWidget(QLabel("<b>1. Simulation</b>"))
+        self.lbl_status = QLabel("Ready to build.")
+        self.lbl_status.setStyleSheet("color: gray; font-style: italic;")
+        panel_layout.addWidget(self.lbl_status)
         
-        # Status Label
-        self.status_label = QLabel("Ready")
-        layout.addWidget(self.status_label)
+        self.progress = QProgressBar()
+        self.progress.setTextVisible(False)
+        self.progress.setVisible(False)
+        panel_layout.addWidget(self.progress)
+        
+        btn_run = QPushButton("Generate 3D Model")
+        btn_run.setStyleSheet("background-color: #007ACC; color: white; font-weight: bold; padding: 8px;")
+        btn_run.clicked.connect(self.start_simulation)
+        panel_layout.addWidget(btn_run)
 
-        # Button
-        self.btn_run = QPushButton("Generate 3D Model")
-        self.btn_run.clicked.connect(self.start_simulation)
-        layout.addWidget(self.btn_run)
+        panel_layout.addWidget(self._create_separator())
 
-        # Colors
+        # -- Section: Camera & View --
+        panel_layout.addWidget(QLabel("<b>2. Camera Presets</b>"))
+        cam_grid = QGridLayout()
+        btn_iso = QPushButton("ISO"); btn_iso.clicked.connect(lambda: self.set_cam(-45, 30))
+        btn_top = QPushButton("TOP"); btn_top.clicked.connect(lambda: self.set_cam(0, 90))
+        btn_front = QPushButton("FRONT"); btn_front.clicked.connect(lambda: self.set_cam(-90, 0))
+        btn_side = QPushButton("SIDE"); btn_side.clicked.connect(lambda: self.set_cam(0, 0))
+        cam_grid.addWidget(btn_iso, 0, 0); cam_grid.addWidget(btn_top, 0, 1)
+        cam_grid.addWidget(btn_front, 1, 0); cam_grid.addWidget(btn_side, 1, 1)
+        panel_layout.addLayout(cam_grid)
+
+        # -- Section: Appearance --
+        panel_layout.addWidget(QLabel("<b>3. Appearance</b>"))
+        
+        # Z-Scale Slider
+        panel_layout.addWidget(QLabel("Z-Axis Exaggeration:"))
+        self.slider_z = QSlider(Qt.Horizontal)
+        self.slider_z.setRange(1, 200) # 0.1x to 20.0x
+        self.slider_z.setValue(20) # Default 2.0x
+        self.slider_z.valueChanged.connect(self.update_z_scale)
+        panel_layout.addWidget(self.slider_z)
+
+        # Transparency
+        self.chk_translucent = QCheckBox("Translucent Materials")
+        self.chk_translucent.setChecked(True)
+        self.chk_translucent.toggled.connect(self.toggle_transparency)
+        panel_layout.addWidget(self.chk_translucent)
+
+        # Grid Toggle
+        chk_grid = QCheckBox("Show Grid/Axis")
+        chk_grid.setChecked(True)
+        chk_grid.toggled.connect(self.toggle_grid)
+        panel_layout.addWidget(chk_grid)
+
+        panel_layout.addWidget(self._create_separator())
+
+        # -- Section: Export --
+        btn_snap = QPushButton("Save Screenshot")
+        btn_snap.clicked.connect(self.save_snapshot)
+        panel_layout.addWidget(btn_snap)
+
+        panel_layout.addStretch()
+        main_layout.addWidget(panel, stretch=1)
+
+        # Materials colors
         self.colors = [
             (0,0,0,0), (0.6,0.6,0.6,1), (0.2,0.4,0.8,0.6), 
             (0.8,0.2,0.2,0.6), (0.2,0.8,0.2,0.6), (0.9,0.9,0.2,0.7)
         ]
 
-    def start_simulation(self):
-        # Disable button, show progress
-        self.btn_run.setEnabled(False)
-        self.progress_bar.setValue(0)
-        self.progress_bar.setVisible(True)
-        self.gl_view.items = [i for i in self.gl_view.items if isinstance(i, gl.GLGridItem)] # Clear old mesh
+    def _create_separator(self):
+        line = QFrame()
+        line.setFrameShape(QFrame.HLine)
+        line.setFrameShadow(QFrame.Sunken)
+        return line
+
+    def set_cam(self, az, el):
+        self.gl_view.setCameraPosition(elevation=el, azimuth=az)
+
+    def toggle_grid(self, visible):
+        self.grid_item.setVisible(visible)
+        self.axis_item.setVisible(visible)
+
+    def toggle_transparency(self, checked):
+        # We need to re-add items to change glOptions in pyqtgraph
+        # But for simple opacity update, we can tweak colors
+        alpha = 0.6 if checked else 1.0
+        for mesh_item in self.generated_meshes:
+            c = mesh_item.color
+            # Update alpha channel
+            mesh_item.setColor((c[0], c[1], c[2], alpha))
+
+    def update_z_scale(self):
+        # Convert slider 1-200 to float 0.1-20.0
+        new_scale = self.slider_z.value() / 10.0
         
+        if not self.generated_meshes: return
+        
+        # Apply transform relative to previous scale
+        for item in self.generated_meshes:
+            item.resetTransform() # Clear old scaling
+            # Scale X,Y=1 (normal), Z=new_scale
+            item.scale(1, 1, new_scale) 
+            
+        self.current_z_scale = new_scale
+
+    def save_snapshot(self):
+        path, _ = QFileDialog.getSaveFileName(self, "Save Image", "3d_view.png", "PNG (*.png)")
+        if path:
+            self.gl_view.grabFrameBuffer().save(path)
+
+    def start_simulation(self):
+        self.progress.setVisible(True)
+        self.progress.setValue(0)
+        
+        # Clear old meshes
+        for m in self.generated_meshes:
+            self.gl_view.removeItem(m)
+        self.generated_meshes.clear()
+
         # Start Worker
         self.worker = SimulationWorker(self.project, self.project.canvas_width, self.project.canvas_height)
         self.worker.progress_update.connect(self.on_progress)
@@ -1446,56 +1617,75 @@ class ThreeDViewDialog(QDialog):
         self.worker.start()
 
     def on_progress(self, percent, message):
-        self.progress_bar.setValue(percent)
-        self.status_label.setText(message)
+        self.progress.setValue(percent)
+        self.lbl_status.setText(message)
 
     def on_error(self, msg):
-        self.status_label.setText(f"Error: {msg}")
-        self.btn_run.setEnabled(True)
-        self.progress_bar.setVisible(False)
+        self.lbl_status.setText("Error!")
+        QMessageBox.critical(self, "Simulation Error", msg)
+        self.progress.setVisible(False)
 
-    def on_finished(self, volume, res):
-        self.status_label.setText("Rendering Meshes...")
-        QApplication.processEvents() # Allow UI to update text
+    def on_finished(self, volume, res, offset):
+        self.lbl_status.setText("Rendering...")
+        QApplication.processEvents()
+        
+        min_x, min_y = offset
         
         try:
             unique_mats = np.unique(volume)
             
+            # Calculate center of the model for camera focus
+            center_x = min_x + (volume.shape[0] * res) / 2
+            center_y = min_y + (volume.shape[1] * res) / 2
+            
             for mid in unique_mats:
                 if mid == 0: continue
                 
-                # Create mask for this material
+                # Isolate material
                 mat_vol = (volume == mid).astype(float)
                 
-                # Smooth for nicer visuals
+                # Smooth
                 from scipy.ndimage import gaussian_filter
                 mat_vol = gaussian_filter(mat_vol, sigma=0.5) 
                 
-                # Marching Cubes
-                verts, faces, _, _ = measure.marching_cubes(mat_vol, level=0.5)
+                # Marching Cubes (Mac-Safe)
+                verts, faces, normals, _ = measure.marching_cubes(mat_vol, level=0.5)
                 
-                # Scale vertices to world coordinates
+                # --- Coordinate Mapping Fix ---
+                # 1. Scale voxels to world units
                 verts[:, 0] *= res
                 verts[:, 1] *= res
-                verts[:, 2] *= 2.0 # Arbitrary Z-scale for visualization
+                verts[:, 2] *= 1.0 # Z scale (voxels are approx 1 unit high)
                 
-                # Center the model
-                verts[:, 0] -= (volume.shape[0] * res) / 2
-                verts[:, 1] -= (volume.shape[1] * res) / 2
+                # 2. Translate to actual position (add the crop offset)
+                verts[:, 0] += min_x
+                verts[:, 1] += min_y
                 
-                mesh = gl.GLMeshItem(vertexes=verts, faces=faces, 
+                # 3. Center it in the view (Move everything so center is at 0,0,0)
+                verts[:, 0] -= center_x
+                verts[:, 1] -= center_y
+                
+                # Create Mesh
+                mesh = gl.GLMeshItem(vertexes=verts, 
+                                     faces=faces, 
+                                     normals=normals, 
                                      color=self.colors[mid % len(self.colors)],
-                                     shader='shaded', smooth=True, 
+                                     smooth=True, 
                                      glOptions='translucent')
+                
                 self.gl_view.addItem(mesh)
-            
-            self.status_label.setText("Simulation Complete.")
+                self.generated_meshes.append(mesh)
+
+            self.update_z_scale()
+            self.lbl_status.setText("Done.")
             
         except Exception as e:
-            self.status_label.setText(f"Rendering Error: {str(e)}")
+            import traceback
+            traceback.print_exc()
+            self.lbl_status.setText("Render Failed.")
             
+        self.progress.setVisible(False)
         self.btn_run.setEnabled(True)
-        self.progress_bar.setVisible(False)
 
 # -------------------------- Main window --------------------------
 
