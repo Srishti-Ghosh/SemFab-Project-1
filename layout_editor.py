@@ -302,7 +302,7 @@ class LayerPropertiesDialog(QDialog):
         self.layer = layer
         self.selected_color = QColor(*layer.color)
         
-        self.resize(400, 300)
+        self.resize(450, 280) # Slightly wider for the new layout
         layout = QVBoxLayout(self)
         form = QGridLayout()
 
@@ -331,44 +331,64 @@ class LayerPropertiesDialog(QDialog):
         form.addWidget(sep, 3, 0, 1, 2)
         form.addWidget(QLabel("<b>3D / Physics Properties</b>"), 4, 0, 1, 2)
 
-        # 4. Thickness
-        self.spin_thick = QDoubleSpinBox()
-        self.spin_thick.setRange(0, 1000)
-        self.spin_thick.setValue(layer.thickness_2_5d)
-        self.spin_thick.setSuffix(" µm")
-        form.addWidget(QLabel("Thickness:"), 5, 0)
-        form.addWidget(self.spin_thick, 5, 1)
-
-        # 5. Material (from DB)
+        # 4. Material (from DB)
         self.combo_mat = QComboBox()
         self.combo_mat.addItems(sorted(MATERIAL_DB.keys()))
         if layer.material in MATERIAL_DB:
             self.combo_mat.setCurrentText(layer.material)
-        form.addWidget(QLabel("Material:"), 6, 0)
-        form.addWidget(self.combo_mat, 6, 1)
+        else:
+            self.combo_mat.setCurrentText("Silicon")
+            
+        form.addWidget(QLabel("Material:"), 5, 0)
+        form.addWidget(self.combo_mat, 5, 1)
 
-        # 6. Concentration (Transparency)
-        self.slider_conc = QSlider(Qt.Horizontal)
-        self.slider_conc.setRange(0, 100)
-        self.slider_conc.setValue(int(layer.concentration * 100))
-        self.lbl_conc_val = QLabel(f"{int(layer.concentration * 100)}%")
-        self.slider_conc.valueChanged.connect(lambda v: self.lbl_conc_val.setText(f"{v}%"))
+        # 5. Concentration (Split Fields)
+        # Logic: Convert Alpha (0-1) back to Dose
+        # Formula: Dose = 10 ^ (Alpha * 9 + 12) -> range 1e12 to 1e21
+        current_dose = 10 ** (layer.concentration * 9 + 12)
         
-        form.addWidget(QLabel("Concentration:"), 7, 0)
-        conc_layout = QHBoxLayout()
-        conc_layout.addWidget(self.slider_conc)
-        conc_layout.addWidget(self.lbl_conc_val)
-        form.addLayout(conc_layout, 7, 1)
+        # Extract Base and Exponent from current_dose
+        import math
+        try:
+            if current_dose <= 0: current_dose = 1e15
+            exponent = int(math.floor(math.log10(current_dose)))
+            base = current_dose / (10**exponent)
+        except:
+            base, exponent = 1.0, 15
 
-        # Add logic to preview transparency
+        # Create Layout for "Base x 10^Exp"
+        conc_layout = QHBoxLayout()
+        
+        # Base Input (1.0 - 9.99)
+        self.spin_base = QDoubleSpinBox()
+        self.spin_base.setRange(1.0, 9.99)
+        self.spin_base.setSingleStep(0.1)
+        self.spin_base.setDecimals(2)
+        self.spin_base.setValue(base)
+        self.spin_base.valueChanged.connect(self.update_preview)
+        
+        # Exponent Input (10 - 22)
+        self.spin_exp = QSpinBox()
+        self.spin_exp.setRange(10, 23)
+        self.spin_exp.setValue(exponent)
+        self.spin_exp.valueChanged.connect(self.update_preview)
+
+        # Add widgets with text labels
+        conc_layout.addWidget(self.spin_base)
+        conc_layout.addWidget(QLabel(" × 10 ^"))
+        conc_layout.addWidget(self.spin_exp)
+        conc_layout.addWidget(QLabel(" cm⁻³"))
+        conc_layout.addStretch()
+        
+        form.addWidget(QLabel("Doping Conc.:"), 6, 0)
+        form.addLayout(conc_layout, 6, 1)
+
+        # 6. Preview Box
         self.lbl_preview = QLabel("3D Preview")
         self.lbl_preview.setAlignment(Qt.AlignCenter)
         self.lbl_preview.setFixedHeight(30)
-        self.update_preview()
-        self.combo_mat.currentTextChanged.connect(self.update_preview)
-        self.slider_conc.valueChanged.connect(self.update_preview)
         
-        form.addWidget(self.lbl_preview, 8, 0, 1, 2)
+        form.addWidget(self.lbl_preview, 7, 0, 1, 2)
 
         layout.addLayout(form)
         
@@ -376,6 +396,10 @@ class LayerPropertiesDialog(QDialog):
         btns.accepted.connect(self.accept)
         btns.rejected.connect(self.reject)
         layout.addWidget(btns)
+        
+        # Trigger initial preview
+        self.update_preview()
+        self.combo_mat.currentTextChanged.connect(self.update_preview)
 
     def pick_color(self):
         c = QColorDialog.getColor(self.selected_color, self, "Select 2D Color")
@@ -386,27 +410,54 @@ class LayerPropertiesDialog(QDialog):
     def update_color_btn(self):
         self.btn_color.setStyleSheet(f"background-color: {self.selected_color.name()}; border: 1px solid gray;")
 
+    def _calculate_alpha(self):
+        """
+        Calculates opacity (0.0 - 1.0) based on Split Input.
+        Uses Log Scale: 1e12 is transparent, 1e21 is solid.
+        """
+        base = self.spin_base.value()
+        exponent = self.spin_exp.value()
+        
+        # Calculate total value in log space directly
+        # log10(base * 10^exp) = log10(base) + exp
+        import math
+        try:
+            log_val = math.log10(base) + exponent
+            # Map range: 12.0 (transparent) -> 21.0 (solid)
+            # Formula: (log_val - min) / (max - min)
+            alpha = (log_val - 12.0) / (21.0 - 12.0)
+            return min(1.0, max(0.1, alpha)) # Clamp between 0.1 and 1.0
+        except:
+            return 1.0
+
     def update_preview(self):
         mat_name = self.combo_mat.currentText()
         base_rgb = MATERIAL_DB.get(mat_name, (0.5, 0.5, 0.5))
-        alpha = self.slider_conc.value() / 100.0
+        
+        alpha = self._calculate_alpha()
         
         r, g, b = [int(c*255) for c in base_rgb]
-        # Checkerboard background to show alpha
+        
+        # Checkerboard background logic to visualize transparency
         self.lbl_preview.setStyleSheet(
             f"background-color: rgba({r}, {g}, {b}, {alpha}); "
-            f"border: 1px solid black; color: {'white' if alpha > 0.5 else 'black'};"
+            f"border: 1px solid #555; "
+            f"color: {'white' if alpha > 0.5 else 'black'};"
         )
-        self.lbl_preview.setText(f"{mat_name} ({int(alpha*100)}%)")
+        # Show user the calculated opacity %
+        dose_str = f"{self.spin_base.value():.1f}e{self.spin_exp.value()}"
+        self.lbl_preview.setText(f"{mat_name} (Opacity: {int(alpha*100)}%)")
 
     def get_data(self):
+        # We return 'concentration' as the visual Alpha (0-1) calculated from the input dose
         return {
             "name": self.inp_name.text(),
             "color": (self.selected_color.red(), self.selected_color.green(), self.selected_color.blue()),
             "fill_pattern": self.combo_pattern.currentText(),
-            "thickness": self.spin_thick.value(),
+            # Return ORIGINAL thickness to avoid overwriting process history
+            "thickness": self.layer.thickness_2_5d, 
             "material": self.combo_mat.currentText(),
-            "concentration": self.slider_conc.value() / 100.0
+            "concentration": self._calculate_alpha()
         }
 
 class ShapeEditDialog(QDialog):
@@ -1949,14 +2000,25 @@ class ThreeDViewDialog(QDialog):
         if path: self.gl_view.grabFrameBuffer().save(path)
 
     def reset_view(self):
-        if self.worker: self.worker.terminate()
+        if self.worker and self.worker.isRunning():
+            self.worker.terminate()
+            self.worker.wait() # Critical: Wait for thread to actually die
         self.worker = None
+        
         for m in self.generated_meshes:
-            try: self.gl_view.removeItem(m)
-            except: pass
+            try:
+                if m in self.gl_view.items:
+                    self.gl_view.removeItem(m)
+                m.meshData = None
+            except Exception: 
+                pass
+        
         self.generated_meshes.clear()
         self.lbl_status.setText("Cleared.")
         self.btn_run.setEnabled(True)
+        self.progress.setVisible(False)
+        
+        self.gl_view.update()
 
     def start_simulation(self):
         self.reset_view()
@@ -1974,74 +2036,83 @@ class ThreeDViewDialog(QDialog):
         self.lbl_status.setText("Meshing (Marching Cubes)...")
         QApplication.processEvents()
         min_x, min_y = offset
-        vol_w = volume.shape[0] * res
-        vol_h = volume.shape[1] * res
-        center_x = min_x + vol_w / 2.0
-        center_y = min_y + vol_h / 2.0
 
         try:
             unique_ids = np.unique(volume)
             
+            # --- Calculate Centering ---
+            # We center the model so it doesn't appear "far away"
+            vol_w_um = volume.shape[0] * res
+            vol_h_um = volume.shape[1] * res
+            center_x = min_x + vol_w_um / 2.0
+            center_y = min_y + vol_h_um / 2.0
+
             def get_style(mid):
-                # 1. Find Name
+                # Find Name
                 name = "Silicon"
                 for n, id_val in MAT_NAME_TO_ID.items():
                     if id_val == mid: name = n; break
                 if mid == MatID.POLY_N: name = "Phosphorus Doped"
                 if mid == MatID.POLY_P: name = "Boron Doped"
                 
-                # 2. Color
+                # Get Color & Concentration
                 rgb = MATERIAL_DB.get(name, (0.5,0.5,0.5))
-                
-                # 3. Alpha
                 alpha = 1.0
                 for l in self.project.layers:
                     if l.visible and getattr(l, 'material', '') == name:
                         alpha = getattr(l, 'concentration', 1.0)
                         break
                 return rgb[0], rgb[1], rgb[2], max(0.1, alpha)
-            
+
             for uid in unique_ids:
                 if uid == MatID.AIR: continue
-                mat_vol = (volume == uid).astype(float)
-                mat_vol = gaussian_filter(mat_vol, sigma=0.6)
-                try: verts, faces, normals, _ = measure.marching_cubes(mat_vol, level=0.5)
-                except ValueError: continue
                 
-                # --- CRITICAL FIX: CENTER THE MESH ---
-                # 1. Scale to microns
+                # 1. Extract Volume
+                mat_vol = (volume == uid).astype(float)
+                mat_vol = gaussian_filter(mat_vol, sigma=0.6) # Smooth edges
+                
+                try: 
+                    verts, faces, normals, _ = measure.marching_cubes(mat_vol, level=0.5)
+                except ValueError: 
+                    continue
+                
+                # 2. Scale & Translate (Fixing the "Off Center" issue)
                 verts[:, 0] *= res
                 verts[:, 1] *= res
                 verts[:, 2] *= res
                 
-                # 2. Translate to World Position
-                verts[:, 0] += min_x
-                verts[:, 1] += min_y
+                # Move to World Coords, then subtract Center to place at (0,0,0)
+                verts[:, 0] += (min_x - center_x)
+                verts[:, 1] += (min_y - center_y)
                 
-                # 3. Re-center to (0,0) for the GL Camera
-                verts[:, 0] -= center_x
-                verts[:, 1] -= center_y
+                # 3. DATA SANITIZATION (Fixes OpenGL Crashes)
+                # Must be Float32 and Contiguous for PyOpenGL
+                verts_clean = np.ascontiguousarray(verts, dtype=np.float32)
+                faces_clean = np.ascontiguousarray(faces, dtype=np.int32)
+                normals_clean = np.ascontiguousarray(normals, dtype=np.float32)
                 
-                # --- 3. CRITICAL FIX: DATA SANITIZATION FOR OPENGL ---
-                # PyOpenGL on macOS crashes if data is float64 or non-contiguous
-                verts = np.ascontiguousarray(verts, dtype=np.float32)
-                faces = np.ascontiguousarray(faces, dtype=np.int32)
-                normals = np.ascontiguousarray(normals, dtype=np.float32)
-                
+                # 4. Visuals
                 r,g,b,a = get_style(uid)
                 is_trans = (a < 1.0 and self.chk_translucent.isChecked())
                 
                 mesh = gl.GLMeshItem(
-                    vertexes=verts, 
-                    faces=faces, 
-                    normals=normals, 
+                    vertexes=verts_clean, 
+                    faces=faces_clean, 
+                    normals=normals_clean, 
                     color=(r,g,b,a), 
                     smooth=True, 
                     glOptions='translucent' if is_trans else 'opaque',
-                    shader='balloon' # 'balloon' shader handles lighting better on round objects
+                    shader='balloon'
                 )
                 
+                # --- CRITICAL FIX: PREVENT GARBAGE COLLECTION ---
+                # We attach the arrays to the object so Python doesn't delete them
+                # while the GPU is still reading them.
+                mesh._verts_keep_alive = verts_clean
+                mesh._faces_keep_alive = faces_clean
+                mesh._normals_keep_alive = normals_clean
                 mesh._orig_color = (r,g,b,a)
+                
                 self.gl_view.addItem(mesh)
                 self.generated_meshes.append(mesh)
 
