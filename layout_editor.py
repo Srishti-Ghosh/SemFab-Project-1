@@ -4,71 +4,64 @@ import json
 import copy
 import uuid
 import os
-import skimage
-import pyqtgraph.exporters
 from dataclasses import dataclass, asdict, field, is_dataclass
-from typing import Dict, List, Tuple, Optional
+from typing import Dict, List, Tuple, Any, Optional
 from uuid import UUID
-from skimage import measure
-from scipy.ndimage import gaussian_filter
 
-# --- 3D Dependencies ---
+# --- PyQt5 Core & GUI Imports ---
+from PyQt5.QtCore import (Qt, QRectF, QPointF, QSize, QSizeF, QMimeData, pyqtSignal, QLineF, QUrl, QThread)
+from PyQt5.QtGui import (
+    QBrush, QPen, QColor, QPolygonF, QCursor, QPainter, QPixmap, QIcon, QPainterPath, QDrag, QPalette, QFont, QTransform, QDesktopServices)
+from PyQt5.QtWidgets import (
+    QApplication, QMainWindow, QAction, QFileDialog, QColorDialog, QCheckBox, QDialog, QComboBox, QLabel, QDoubleSpinBox, QGraphicsView, QGraphicsScene, 
+    QGraphicsRectItem, QGraphicsPolygonItem, QGraphicsItem, QPushButton, QLineEdit, QGridLayout, QSpinBox, QVBoxLayout, QDialogButtonBox, QToolTip, 
+    QProgressBar, QDockWidget, QListWidget, QListWidgetItem, QWidget, QHBoxLayout, QMessageBox, QGraphicsEllipseItem, QInputDialog, QTabWidget, QFrame, 
+    QToolButton, QSlider, QGraphicsLineItem, QMenu, QGraphicsSceneMouseEvent, QSplitter, QGroupBox, QRadioButton, QButtonGroup, QToolBar, QAbstractItemView)
+from PyQt5.QtSvg import QSvgGenerator
+
 try:
-    import pyqtgraph.opengl as gl
-    import pyqtgraph as pg
-    from skimage import measure  # <--- Defines 'measure'
     import numpy as np
-    _has_3d_deps = True          # <--- Defines '_has_3d_deps'
+    import pyqtgraph as pg
+    import pyqtgraph.opengl as gl
+    import pyqtgraph.exporters
+    from scipy.ndimage import gaussian_filter, distance_transform_edt
+    
+    try:
+        from skimage import measure
+        from skimage.measure import find_contours
+    except ImportError:
+        measure = None
+        find_contours = None
+        print("Warning: scikit-image not found. Meshing will be disabled.")
+
+    _has_3d_deps = True
+    _has_level_set_deps = True
+
 except ImportError:
-    print("Warning: 3D libraries (pyqtgraph, skimage) not found.")
+    print("Warning: Scientific libraries (numpy, scipy, pyqtgraph) not found. 3D features disabled.")
     _has_3d_deps = False
-    measure = None
+    _has_level_set_deps = False
+    np = None
+    pg = None
     gl = None
-# This is a stub for the gdstk library if it's not installed.
-# For full functionality, install it: pip install gdstk
+    measure = None
+    gaussian_filter = None
+    distance_transform_edt = None
+    find_contours = None
+
 try:
     import gdstk
 except ImportError:
-    print("Warning: gdstk library not found. GDS/OAS, fillet, boolean features, and some simulation aspects will be disabled.")
+    print("Warning: gdstk library not found. GDS/OAS export and boolean operations disabled.")
     gdstk = None
 
-# Added for the 2_5d view logic and Level Set
 try:
     from matplotlib.path import Path
 except ImportError:
-    print("Warning: matplotlib library not found. 2.5D view and Level Set initialization will be disabled.")
+    print("Warning: matplotlib not found. Advanced path calculations disabled.")
     Path = None
 
-# Added for Level Set Simulation
-try:
-    from scipy.ndimage import distance_transform_edt
-    from skimage.measure import find_contours
-    _has_level_set_deps = True
-except ImportError:
-    print("Warning: numpy, scipy, or scikit-image not found. Level Set simulation features will be disabled. 3D Voxel View disabled.")
-    np = None
-    distance_transform_edt = None
-    find_contours = None
-    _has_level_set_deps = False
-
-
-from PyQt5.QtCore import Qt, QRectF, QPointF, QSize, QSizeF, QMimeData, pyqtSignal, QLineF, QUrl
-from PyQt5.QtGui import (QBrush, QPen, QColor, QPolygonF, QCursor, QPainter, QPixmap, QIcon, QPainterPath,
-                         QDrag, QPalette, QFont, QTransform, QDesktopServices)
-from PyQt5.QtWidgets import (
-    QApplication, QMainWindow, QAction, QFileDialog, QColorDialog, QCheckBox,
-    QGraphicsView, QGraphicsScene, QGraphicsRectItem, QGraphicsPolygonItem,
-    QGraphicsItem, QToolBar, QPushButton, QLabel, QLineEdit, QGridLayout,
-    QSpinBox, QCheckBox, QDialog, QVBoxLayout, QDialogButtonBox, QToolTip, QProgressBar, QApplication,
-    QDockWidget, QListWidget, QListWidgetItem, QWidget, QHBoxLayout, QMessageBox, QDoubleSpinBox, QGraphicsEllipseItem, QComboBox,
-    QInputDialog, QTabWidget, QFrame, QToolButton, QGridLayout, QSlider, QGraphicsLineItem, QMenu, QGraphicsSceneMouseEvent, QDialog, 
-    QApplication, QSplitter, QGroupBox, QRadioButton, QButtonGroup, QVBoxLayout, QHBoxLayout, QWidget, QFrame, QLabel, 
-    QProgressBar, QPushButton, QGridLayout, QSlider, QCheckBox, QComboBox
-)
-from PyQt5.QtSvg import QSvgGenerator
-
 # -------------------------- Data model --------------------------
-# --- 3D Simulation Configuration ---
 
 class MatID:
     AIR = 0
@@ -89,7 +82,6 @@ class MatID:
     POLY_N = 20
     POLY_P = 21
 
-# Name to ID Mapping (Links Layer Properties to Physics)
 MAT_NAME_TO_ID = {
     "Air": MatID.AIR,
     "Silicon": MatID.SILICON,
@@ -106,13 +98,12 @@ MAT_NAME_TO_ID = {
     "BF2 Doped": MatID.SI_P_BF2
 }
 
-# RGBA Colors for the Voxel Renderer
 MATERIAL_DB = {
-    "Silicon": (0.3, 0.3, 0.35),       # Dark Grey
+    "Silicon": (0.2, 0.2, 0.3),       # Dark Grey
     "Polysilicon": (0.7, 0.2, 0.2),    # Rust Red
     "Silicon Oxide": (0.8, 0.9, 1.0),  # Glassy Blue
     "Silicon Nitride": (0.2, 0.6, 0.3),# Greenish
-    "Aluminum": (0.9, 0.9, 0.9),       # Silver
+    "Aluminum": (0.9, 0.9, 1.0),       # Silver
     "Photoresist": (0.6, 0.1, 0.6),    # Purple
     
     # N-Type (Cool)
@@ -164,6 +155,35 @@ class Cell:
     etch_pairs: List[Tuple[str, str, float]] = field(default_factory=list)
 
 @dataclass
+class ProcessStep:
+    id: int                # Unique ID for tracking
+    action_type: str       # "Deposition", "Etch", "Doping", "Lithography"
+    description: str       # "Deposit 0.5um Silicon"
+    mask_layer: Optional[str] = None  # Name of the layer used as a mask (None = Blanket)    
+    params: Dict[str, Any] = field(default_factory=dict)
+    enabled: bool = True
+    def to_dict(self):
+        return {
+            "id": self.id,
+            "action_type": self.action_type,
+            "description": self.description,
+            "mask_layer": self.mask_layer,
+            "params": self.params,
+            "enabled": self.enabled
+        }
+
+    @classmethod
+    def from_dict(cls, data):
+        return cls(
+            id=data.get("id", 0),
+            action_type=data.get("action_type", "Unknown"),
+            description=data.get("description", ""),
+            mask_layer=data.get("mask_layer"),
+            params=data.get("params", {}),
+            enabled=data.get("enabled", True)
+        )
+
+@dataclass
 class Project:
     units: str = "um"
     layers: List[Layer] = field(default_factory=list)
@@ -173,7 +193,49 @@ class Project:
     canvas_width: int = 2000
     canvas_height: int = 1500
     layer_by_name: Dict[str, Layer] = field(default_factory=dict, init=False)
+    process_sequence: List[ProcessStep] = field(default_factory=list)    
+    _next_step_id: int = 0
+    
+    def to_json(self):
+        return json.dumps({
+            "units": self.units,
+            "top": self.top,
+            "layers": [l.to_dict() for l in self.layers],             
+            "process_sequence": [step.to_dict() for step in self.process_sequence],            
+            "cells": {name: cell.to_dict() for name, cell in self.cells.items()}
+        }, indent=4)
 
+    @classmethod
+    def from_json(cls, json_str):
+        data = json.loads(json_str)
+        proj = cls()
+        proj.units = data.get("units", "um")
+        proj.top = data.get("top", "TOP")
+        
+        if "layers" in data:
+            proj.layers = [Layer.from_dict(l) for l in data["layers"]]
+        if "process_sequence" in data:
+            proj.process_sequence = [ProcessStep.from_dict(s) for s in data["process_sequence"]]
+            if proj.process_sequence:
+                proj._next_step_id = max(s.id for s in proj.process_sequence)
+        if "cells" in data:
+            for name, cell_data in data["cells"].items():
+                proj.cells[name] = Cell.from_dict(cell_data)
+        proj.refresh_layer_map()
+        return proj
+        
+    def add_step(self, action, description, mask=None, params=None):
+        self._next_step_id += 1
+        new_step = ProcessStep(
+            id=self._next_step_id,
+            action_type=action,
+            description=description,
+            mask_layer=mask,
+            params=params or {}
+        )
+        self.process_sequence.append(new_step)
+        return new_step
+    
     def __post_init__(self):
         self.refresh_layer_map()
 
@@ -522,7 +584,6 @@ class FilletDialog(QDialog):
 
     def get_radius(self): return self.radius_spin.value()
 
-# RENAMED from Interactive3DView
 class Interactive2_5dView(QGraphicsView):
     def __init__(self, scene, parent_dialog):
         super().__init__(scene)
@@ -557,7 +618,6 @@ class Interactive2_5dView(QGraphicsView):
         self.parent_dialog.zoom_scale *= zoom_factor
         self.parent_dialog.draw_2_5d_view() # RENAMED
 
-# RENAMED from ThreeDViewDialog
 class TwoPointFiveDViewDialog(QDialog):
     def __init__(self, project, parent=None):
         super().__init__(parent)
@@ -848,7 +908,350 @@ class TwoPointFiveDViewDialog(QDialog):
                 margin = max(10, bounds.width() * 0.05) # Ensure some margin even if width is 0
                 self.view.fitInView(bounds.adjusted(-margin, -margin, margin, margin), Qt.KeepAspectRatio)
 
+class ProcessDialog(QDialog):
+    def __init__(self, project, parent=None):
+        super().__init__(parent)
+        self.setWindowTitle("Add Process Step")
+        self.project = project
+        self.setMinimumWidth(450)
 
+        layout = QVBoxLayout(self)
+        form_layout = QGridLayout()
+
+        # 1. Step Selection
+        self.combo_step = QComboBox()
+        self.combo_step.addItems(["Deposition", "Etch", "Doping", "Oxidation"])
+        # Connect Step change to repopulate types
+        self.combo_step.currentTextChanged.connect(self._update_ui_state)
+        
+        # 2. Type Selection
+        self.combo_type = QComboBox()
+        # Connect Type change to hide/show fields (Dynamic Logic)
+        self.combo_type.currentTextChanged.connect(self._update_dynamic_fields)
+        
+        # 3. Layer Selection
+        self.combo_layer1 = QComboBox() 
+        self.update_layer_lists()
+
+        # 4. Masked vs Blanket
+        self.chk_masked = QCheckBox("Use Layer as Mask (Patterned)")
+        self.chk_masked.setChecked(True)
+        self.chk_masked.setToolTip("If checked, process only occurs inside shapes.\nIf unchecked, process applies to entire wafer (Blanket).")
+
+        # 5. Parameters
+        self.lbl_param1 = QLabel("Thickness (µm):")
+        self.spin_param1 = QDoubleSpinBox()
+        self.spin_param1.setRange(-1000, 1000); self.spin_param1.setValue(0.5)
+        
+        self.lbl_param2 = QLabel("Depth/Time:")
+        self.spin_param2 = QDoubleSpinBox()
+        self.spin_param2.setRange(0, 10000); self.spin_param2.setValue(1.0)
+
+        # Layout Assembly
+        row = 0
+        form_layout.addWidget(QLabel("Process Step:"), row, 0); form_layout.addWidget(self.combo_step, row, 1); row+=1
+        form_layout.addWidget(QLabel("Method:"), row, 0); form_layout.addWidget(self.combo_type, row, 1); row+=1
+        
+        self.lbl_layer1 = QLabel("Target Layer:")
+        form_layout.addWidget(self.lbl_layer1, row, 0); form_layout.addWidget(self.combo_layer1, row, 1); row+=1
+        
+        # Add the Mask Checkbox
+        form_layout.addWidget(QLabel("Masking:"), row, 0); form_layout.addWidget(self.chk_masked, row, 1); row+=1
+        
+        form_layout.addWidget(self.lbl_param1, row, 0); form_layout.addWidget(self.spin_param1, row, 1); row+=1
+        form_layout.addWidget(self.lbl_param2, row, 0); form_layout.addWidget(self.spin_param2, row, 1); row+=1
+
+        layout.addLayout(form_layout)
+
+        buttons = QDialogButtonBox(QDialogButtonBox.Ok | QDialogButtonBox.Cancel)
+        buttons.accepted.connect(self.accept)
+        buttons.rejected.connect(self.reject)
+        layout.addWidget(buttons)
+
+        # Trigger initial state
+        self._update_ui_state(self.combo_step.currentText())
+
+    def update_layer_lists(self):
+        layer_names = [l.name for l in self.project.layers]
+        self.combo_layer1.clear(); self.combo_layer1.addItems(layer_names)
+
+    def _update_ui_state(self, step_name):
+        """Populates the Type Combobox based on Step Selection"""
+        self.combo_type.blockSignals(True) # Prevent triggering dynamic fields while clearing
+        self.combo_type.clear()
+        
+        if step_name == "Deposition":
+            self.combo_type.addItems(["Stacked (Planar)", "Conformal"])
+            self.lbl_layer1.setText("Layer to Deposit:")
+            self.lbl_param1.setText("Thickness (µm):")
+            
+        elif step_name == "Etch":
+            self.combo_type.addItems(["Dry (Anisotropic)", "Wet (Isotropic)", "CMP (Planar)", "Strip Resist", "Lift-Off"])
+            self.lbl_layer1.setText("Mask Layer:")
+            self.lbl_param1.setText("Etch Depth (µm):")
+
+        elif step_name == "Doping":
+            self.combo_type.addItems(["Ion Implantation", "Diffusion", "Thermal Anneal"])
+            self.lbl_layer1.setText("Mask Layer:")
+            self.lbl_param1.setText("Thickness/Depth (µm):") # Standardized name
+            self.lbl_param2.setText("Dose/Concentration:")
+
+        elif step_name == "Oxidation":
+            self.combo_type.addItems(["Dry Oxidation", "Wet Oxidation (LOCOS)"])
+            self.lbl_layer1.setText("Active Region (Mask):")
+            self.lbl_param1.setText("Target Thickness (µm):")
+
+        self.combo_type.blockSignals(False)
+        
+        # Trigger dynamic field update manually for the first item
+        self._update_dynamic_fields(self.combo_type.currentText())
+
+    def _update_dynamic_fields(self, type_name):
+        """Hides/Disables fields based on specific Method/Type"""
+        step = self.combo_step.currentText()
+        
+        # --- 1. RESET DEFAULTS ---
+        self.lbl_param1.setVisible(True); self.spin_param1.setVisible(True) # Thickness
+        self.lbl_param2.setVisible(False); self.spin_param2.setVisible(False) # Dose/Extra
+        
+        # Reset input states to "Standard" mode
+        self.chk_masked.setEnabled(True) 
+        self.combo_layer1.setEnabled(True) # Enable layer selection by default
+        
+        # --- 2. ETCH LOGIC ---
+        if step == "Etch":
+            if "CMP" in type_name:
+                # CMP is Global / Blanket
+                self.chk_masked.setChecked(False); self.chk_masked.setEnabled(False)
+                self.combo_layer1.setEnabled(False) # <--- DISABLE LAYER SELECT
+                self.lbl_param1.setText("Removal Amount (µm):")
+                
+            elif "Strip" in type_name or "Lift-Off" in type_name:
+                # Strip/Lift-off removes everything, no depth needed
+                self.chk_masked.setChecked(False); self.chk_masked.setEnabled(False)
+                self.combo_layer1.setEnabled(False) # <--- DISABLE LAYER SELECT
+                self.lbl_param1.setVisible(False); self.spin_param1.setVisible(False)
+            
+            else:
+                # Standard Etch (Masked)
+                self.chk_masked.setChecked(True); self.chk_masked.setEnabled(True)
+                self.lbl_param1.setText("Etch Depth (µm):")
+
+        # --- 3. DOPING LOGIC ---
+        elif step == "Doping":
+            if "Anneal" in type_name:
+                # Anneal is Global Thermal process (Blanket)
+                self.chk_masked.setChecked(False); self.chk_masked.setEnabled(False)
+                self.combo_layer1.setEnabled(False) # <--- DISABLE LAYER SELECT
+                self.lbl_param1.setText("Diffusion Length (µm):")
+                self.lbl_param2.setVisible(False); self.spin_param2.setVisible(False)
+            else:
+                # Implant/Diffusion needs Dose
+                self.chk_masked.setEnabled(True)
+                self.lbl_param1.setText("Junction Depth (µm):")
+                self.lbl_param2.setVisible(True); self.spin_param2.setVisible(True)
+
+        # --- 4. DEPOSITION LOGIC ---
+        elif step == "Deposition":
+            # Deposition is usually blanket unless doing Lift-off prep, but allowed to change
+            self.chk_masked.setChecked(False) 
+            self.chk_masked.setEnabled(True)
+            self.lbl_param1.setText("Thickness (µm):")
+
+        # --- 5. OXIDATION LOGIC ---
+        elif step == "Oxidation":
+            # Usually Masked (LOCOS), but can be Blanket
+            self.chk_masked.setChecked(True)
+            self.chk_masked.setEnabled(True)
+            self.lbl_param1.setText("Target Thickness (µm):")
+
+    def get_values(self):
+        return {
+            "step": self.combo_step.currentText(),
+            "type": self.combo_type.currentText(),
+            "layer1": self.combo_layer1.currentText(),
+            "is_masked": self.chk_masked.isChecked(),
+            "param1": self.spin_param1.value(),
+            "param2": self.spin_param2.value()
+        }
+
+class RecipeManagerDialog(QDialog):
+    def __init__(self, project, parent=None):
+        super().__init__(parent)
+        self.setWindowTitle("Process Recipe Manager")
+        self.resize(500, 600)
+        self.project = project
+        
+        # Main Layout
+        layout = QVBoxLayout(self)
+        layout.setSpacing(5)
+        
+        # --- 1. Toolbar (Professional Look) ---
+        toolbar = QToolBar()
+        toolbar.setIconSize(QSize(20, 20))
+        toolbar.setToolButtonStyle(Qt.ToolButtonTextBesideIcon)
+        
+        # Actions
+        act_up = QAction(QIcon("icons/arrow_up.png"), "Move Up", self)
+        act_up.triggered.connect(self.move_step_up)
+        
+        act_down = QAction(QIcon("icons/arrow_down.png"), "Move Down", self)
+        act_down.triggered.connect(self.move_step_down)
+        
+        act_del = QAction(QIcon("icons/delete.png"), "Delete Step", self)
+        act_del.triggered.connect(self.delete_step)
+        
+        act_clear = QAction(QIcon("icons/refresh.png"), "Clear All", self)
+        act_clear.triggered.connect(self.clear_all)
+
+        toolbar.addAction(act_up)
+        toolbar.addAction(act_down)
+        toolbar.addSeparator()
+        toolbar.addAction(act_del)
+        toolbar.addSeparator()
+        toolbar.addAction(act_clear)
+        
+        layout.addWidget(toolbar)
+
+        # --- 2. Info Label ---
+        lbl_info = QLabel("<b>Sequence of Operations:</b><br>Drag and drop items to reorder the fabrication steps.")
+        lbl_info.setStyleSheet("color: #888; font-size: 11px; margin-bottom: 5px;")
+        layout.addWidget(lbl_info)
+
+        # --- 3. The Recipe List ---
+        self.list_widget = QListWidget()
+        self.list_widget.setDragDropMode(QAbstractItemView.InternalMove) # Enable Drag & Drop
+        self.list_widget.setSelectionMode(QAbstractItemView.SingleSelection)
+        self.list_widget.setAlternatingRowColors(True)
+        # Style allows for taller rows and better readability
+        self.list_widget.setStyleSheet("""
+            QListWidget { font-size: 13px; border: 1px solid #444; background: #2b2b2b; color: #eee; }
+            QListWidget::item { padding: 8px; border-bottom: 1px solid #333; }
+            QListWidget::item:selected { background: #4682B4; color: white; }
+        """)
+        layout.addWidget(self.list_widget)
+        
+        # Populate List
+        self.refresh_list()
+
+        # --- 4. Footer Buttons ---
+        btn_layout = QHBoxLayout()
+        btn_layout.addStretch()
+        
+        btn_cancel = QPushButton("Cancel")
+        btn_cancel.clicked.connect(self.reject)
+        # Grey/Neutral styling with rounded corners
+        btn_cancel.setStyleSheet("""
+            QPushButton {
+                background-color: #555555; 
+                color: white; 
+                font-weight: bold; 
+                padding: 6px 12px; 
+                border-radius: 6px;
+            }
+            QPushButton:hover { background-color: #666666; }
+        """)
+        
+        btn_apply = QPushButton("Apply Changes")
+        btn_apply.setIcon(QIcon("icons/save.png"))
+        btn_apply.clicked.connect(self.save_order_and_close)
+        # Green/Success styling with rounded corners
+        btn_apply.setStyleSheet("""
+            QPushButton {
+                background-color: #2E8B57; 
+                color: white; 
+                font-weight: bold; 
+                padding: 6px 12px; 
+                border-radius: 6px;
+            }
+            QPushButton:hover { background-color: #3CB371; }
+        """)
+
+        btn_layout.addWidget(btn_cancel)
+        btn_layout.addWidget(btn_apply)
+        layout.addLayout(btn_layout)
+
+    def refresh_list(self):
+        self.list_widget.clear()
+        
+        # Use the Recipe List
+        source_list = self.project.process_sequence
+        
+        for i, step in enumerate(source_list):
+            # Format the "Action" part
+            action_text = f"{step.action_type}"
+            
+            # Format the "Mask" part
+            if step.mask_layer:
+                mask_text = f"Mask: {step.mask_layer}"
+            else:
+                mask_text = "Global / Blanket"
+            
+            # Format the "Detail" part (Thickness/Depth)
+            # We look into the params dict
+            p_type = step.params.get('physics_type', 'Unknown')
+            val = step.params.get('thickness', 0.0)
+            
+            # Construct the full string
+            # Example: "1. Etch (CMP) - Global / Blanket - (0.5 um)"
+            label = f"{i+1}. {action_text} ({p_type}) - {mask_text} - ({val:.2f} µm)"
+            
+            item = QListWidgetItem(label)
+            item.setData(Qt.UserRole, step)
+            
+            # Add Icons based on action
+            if "Deposition" in action_text: item.setIcon(QIcon("icons/layer.png"))
+            elif "Etch" in action_text: item.setIcon(QIcon("icons/etch.png"))
+            elif "Doping" in action_text: item.setIcon(QIcon("icons/fire.png")) # Fire for thermal/doping
+            
+            self.list_widget.addItem(item)
+
+    def move_step_up(self):
+        row = self.list_widget.currentRow()
+        if row > 0:
+            item = self.list_widget.takeItem(row)
+            self.list_widget.insertItem(row - 1, item)
+            self.list_widget.setCurrentRow(row - 1)
+
+    def move_step_down(self):
+        row = self.list_widget.currentRow()
+        if row < self.list_widget.count() - 1:
+            item = self.list_widget.takeItem(row)
+            self.list_widget.insertItem(row + 1, item)
+            self.list_widget.setCurrentRow(row + 1)
+
+    def delete_step(self):
+        row = self.list_widget.currentRow()
+        if row >= 0:
+            self.list_widget.takeItem(row)
+
+    def clear_all(self):
+        if QMessageBox.question(self, "Clear Recipe", "Are you sure you want to delete all steps?") == QMessageBox.Yes:
+            self.list_widget.clear()
+
+    def save_order_and_close(self):
+        # Reconstruct the list based on visual order
+        new_order = []
+        for i in range(self.list_widget.count()):
+            item = self.list_widget.item(i)
+            obj = item.data(Qt.UserRole)
+            new_order.append(obj)
+        
+        # Save back to project
+        # Determine if we are saving Steps or Layers based on the first item type
+        if new_order:
+            if hasattr(new_order[0], 'description'):
+                self.project.process_sequence = new_order
+            else:
+                self.project.layers = new_order
+        else:
+            # List is empty
+            self.project.process_sequence = []
+            # Note: We probably shouldn't clear layers entirely if in legacy mode
+            # unless user explicitly cleared them.
+
+        self.accept()
+        
 # -------------------------- Graphics items --------------------------
 
 class SceneItemMixin:
@@ -862,7 +1265,6 @@ class SceneItemMixin:
                 # Compare scene positions
                 if event.scenePos() != event.buttonDownScenePos(Qt.LeftButton):
                     view.parent_win.update_data_from_item_move(self)
-
 
 class RectItem(QGraphicsRectItem, SceneItemMixin):
     def __init__(self, rect, layer, data_obj, selectable=True):
@@ -900,7 +1302,6 @@ class RectItem(QGraphicsRectItem, SceneItemMixin):
         if self.scene() and self.scene().views(): # Check scene and views exist
             self.scene().views()[0].parent_win.show_properties_dialog_for_item(self)
 
-
 class PolyItem(QGraphicsPolygonItem, SceneItemMixin):
     def __init__(self, poly, layer, data_obj, selectable=True):
         QGraphicsPolygonItem.__init__(self, poly)
@@ -936,112 +1337,6 @@ class PolyItem(QGraphicsPolygonItem, SceneItemMixin):
         super().mouseDoubleClickEvent(event)
         if self.scene() and self.scene().views(): # Check scene and views exist
             self.scene().views()[0].parent_win.show_properties_dialog_for_item(self)
-
-# -------------------------- Process Dialog (Add this before MainWindow) --------------------------
-
-class ProcessDialog(QDialog):
-    def __init__(self, project, parent=None):
-        super().__init__(parent)
-        self.setWindowTitle("Add Process Step")
-        self.project = project
-        self.setMinimumWidth(450)
-
-        layout = QVBoxLayout(self)
-        form_layout = QGridLayout()
-
-        # 1. Step Selection
-        self.combo_step = QComboBox()
-        self.combo_step.addItems(["Deposition", "Etch", "Doping", "Oxidation"])
-        self.combo_step.currentTextChanged.connect(self._update_ui_state)
-        
-        # 2. Type Selection
-        self.combo_type = QComboBox()
-        
-        # 3. Layer Selection
-        self.combo_layer1 = QComboBox() # The Active Layer
-        self.update_layer_lists()
-
-        # 4. REALISM: Masked vs Blanket
-        self.chk_masked = QCheckBox("Use Layer as Mask (Patterned)")
-        self.chk_masked.setChecked(True)
-        self.chk_masked.setToolTip("If checked, process only occurs inside shapes.\nIf unchecked, process applies to entire wafer (Blanket).")
-
-        # 5. Parameters
-        self.lbl_param1 = QLabel("Thickness (µm):")
-        self.spin_param1 = QDoubleSpinBox()
-        self.spin_param1.setRange(-1000, 1000); self.spin_param1.setValue(0.5)
-        
-        self.lbl_param2 = QLabel("Depth/Time:")
-        self.spin_param2 = QDoubleSpinBox()
-        self.spin_param2.setRange(0, 10000); self.spin_param2.setValue(1.0)
-
-        # Layout Assembly
-        row = 0
-        form_layout.addWidget(QLabel("Process Step:"), row, 0); form_layout.addWidget(self.combo_step, row, 1); row+=1
-        form_layout.addWidget(QLabel("Method:"), row, 0); form_layout.addWidget(self.combo_type, row, 1); row+=1
-        
-        self.lbl_layer1 = QLabel("Target Layer:")
-        form_layout.addWidget(self.lbl_layer1, row, 0); form_layout.addWidget(self.combo_layer1, row, 1); row+=1
-        
-        # Add the Mask Checkbox
-        form_layout.addWidget(QLabel("Masking:"), row, 0); form_layout.addWidget(self.chk_masked, row, 1); row+=1
-        
-        form_layout.addWidget(self.lbl_param1, row, 0); form_layout.addWidget(self.spin_param1, row, 1); row+=1
-        form_layout.addWidget(self.lbl_param2, row, 0); form_layout.addWidget(self.spin_param2, row, 1); row+=1
-
-        layout.addLayout(form_layout)
-
-        buttons = QDialogButtonBox(QDialogButtonBox.Ok | QDialogButtonBox.Cancel)
-        buttons.accepted.connect(self.accept)
-        buttons.rejected.connect(self.reject)
-        layout.addWidget(buttons)
-
-        self._update_ui_state(self.combo_step.currentText())
-
-    def update_layer_lists(self):
-        layer_names = [l.name for l in self.project.layers]
-        self.combo_layer1.clear(); self.combo_layer1.addItems(layer_names)
-
-    def _update_ui_state(self, step_name):
-        self.combo_type.clear()
-        self.lbl_param2.setVisible(False); self.spin_param2.setVisible(False)
-        self.lbl_param1.setVisible(True); self.spin_param1.setVisible(True)
-        
-        # Default: Most things are masked, except usually deposition
-        self.chk_masked.setChecked(True)
-
-        if step_name == "Deposition":
-            self.combo_type.addItems(["Stacked (Planar)", "Conformal"])
-            self.lbl_layer1.setText("Layer to Deposit:")
-            self.lbl_param1.setText("Thickness (µm):")
-            self.chk_masked.setChecked(False) # Deposition is usually blanket by default
-
-        elif step_name == "Etch":
-            self.combo_type.addItems(["Dry (Anisotropic)", "Wet (Isotropic)"])
-            self.lbl_layer1.setText("Mask Layer:")
-            self.lbl_param1.setText("Etch Depth (µm):")
-            self.chk_masked.setChecked(True) # Etch is almost always masked
-
-        elif step_name == "Doping":
-            self.combo_type.addItems(["Ion Implantation", "Diffusion"])
-            self.lbl_layer1.setText("Mask Layer:")
-            self.lbl_param1.setText("Dose/Concentration:")
-            self.lbl_param2.setVisible(True); self.lbl_param2.setText("Energy/Depth (µm):")
-
-        elif step_name == "Oxidation":
-            self.combo_type.addItems(["Dry Oxidation", "Wet Oxidation (LOCOS)"])
-            self.lbl_layer1.setText("Active Region (Mask):")
-            self.lbl_param1.setText("Target Thickness (µm):")
-
-    def get_values(self):
-        return {
-            "step": self.combo_step.currentText(),
-            "type": self.combo_type.currentText(),
-            "layer1": self.combo_layer1.currentText(),
-            "is_masked": self.chk_masked.isChecked(),
-            "param1": self.spin_param1.value(), # <--- CHANGED
-            "param2": self.spin_param2.value()  # <--- CHANGED
-        }
     
 class CircleItem(QGraphicsEllipseItem, SceneItemMixin):
     def __init__(self, rect, layer, data_obj, selectable=True):
@@ -1078,7 +1373,6 @@ class CircleItem(QGraphicsEllipseItem, SceneItemMixin):
         super().mouseDoubleClickEvent(event)
         if self.scene() and self.scene().views(): # Check scene and views exist
             self.scene().views()[0].parent_win.show_properties_dialog_for_item(self)
-
 
 class RefItem(QGraphicsItem):
     def __init__(self, ref, cell, project, selectable=True):
@@ -1148,7 +1442,7 @@ class CellListWidget(QListWidget):
             drag.setMimeData(mimeData)
             drag.exec_(Qt.CopyAction | Qt.LinkAction) # Start the drag
 
-# -------------------------- View/Scene with Rulers --------------------------
+# -------------------------- Canvas --------------------------
 
 class Ruler(QWidget):
     def __init__(self, orientation, canvas, parent=None):
@@ -1515,9 +1809,6 @@ class Canvas(QGraphicsView):
 
         event.acceptProposedAction()
 
-from PyQt5.QtCore import QThread, pyqtSignal
-
-# --- 1. The Worker Thread (Does the math in background) ---
 class SimulationWorker(QThread):
     progress_update = pyqtSignal(int, str)
     finished_data = pyqtSignal(object, object, tuple, dict)
@@ -1584,8 +1875,7 @@ class SimulationWorker(QThread):
                 
                 if "etch" in str(p_type):
                     # Check for specific etch depth override
-                    d_val = float(getattr(layer, 'etch_depth_sim', t) or t)
-                    max_etch_depth = max(max_etch_depth, d_val)
+                    max_etch_depth = max(max_etch_depth, t)
                 else:
                     # Assume deposition or oxidation grows UP
                     total_deposition += t
@@ -1635,59 +1925,169 @@ class SimulationWorker(QThread):
                         mask[rr, cc] = True
                 return mask
 
-            # --- 6. Physics Loop ---
-            total_layers = len(self.project.layers)
+            # --- FIX: HYBRID LOOP (Determine Source of Truth) ---
+            # If the recipe list has items, we use the "Professional" Recipe Loop.
+            # If not, we fall back to the "Simple" Layer Loop (Legacy Mode).
             
-            for i, layer in enumerate(self.project.layers):
-                if not layer.visible: continue
-                
-                p_type = getattr(layer, 'physics_type', None)
-                lname = layer.name.lower()
-                
-                if p_type is None:
-                    if "wet" in lname: p_type = 'etch_iso'
-                    elif "etch" in lname: p_type = 'etch_aniso'
-                    elif "dope" in lname: p_type = 'dope_imp'
-                    elif "ox" in lname: p_type = 'oxidation'
-                    else: p_type = 'depo_planar'
+            use_recipe_mode = len(self.project.process_sequence) > 0
+            steps_to_run = []
+            
+            if use_recipe_mode:
+                steps_to_run = self.project.process_sequence
+            else:
+                # Convert Layers to "Pseudo-Steps" so the loop logic stays clean
+                for layer in self.project.layers:
+                    if not layer.visible: continue
+                    # Create a temporary wrapper object that mimics ProcessStep
+                    pseudo_step = type('obj', (object,), {
+                        'description': layer.name,
+                        'mask_layer': layer.name, # Layer acts as its own mask in legacy mode
+                        'params': {
+                            'physics_type': getattr(layer, 'physics_type', None), # Let None logic handle default
+                            'thickness': float(getattr(layer, 'thickness_2_5d', 0.5) or 0.5),
+                            'material': getattr(layer, 'material', ''),
+                            'is_blanket': getattr(layer, 'is_blanket_sim', False),
+                            'litho_blur': getattr(layer, 'litho_blur_sigma', 0.0)
+                        },
+                        'enabled': True
+                    })
+                    steps_to_run.append(pseudo_step)
 
-                mid = MAT_NAME_TO_ID.get(getattr(layer, 'material', ''), MatID.SILICON_OXIDE)
+            # --- 6. Physics Loop ---
+            total_steps = len(steps_to_run)
+            
+            for i, step in enumerate(steps_to_run):
+                if not step.enabled: continue
                 
-                # Parameters
-                t_val = float(getattr(layer, 'thickness_2_5d', 1.0) or 1.0)
+                # 1. Unpack Parameters
+                params = step.params
+                action_type = getattr(step, 'action_type', 'Legacy') 
+                p_type = params.get('physics_type', None)
+                t_val = params.get('thickness', 0.5)
+                mat_name = params.get('material', '')
+                mask_name = step.mask_layer
+                is_blanket = params.get('is_blanket', False)
+
+                # ========================================================
+                # FIX: RESTRICTED FALLBACK LOGIC
+                # ========================================================
+                should_check_layer = (action_type == "Deposition" or action_type == "Legacy")
                 
-                # MASK GEN
-                mask_2d = get_layer_mask(layer.name)
-                is_blanket = getattr(layer, 'is_blanket_sim', False)
+                if should_check_layer and (not mat_name or mat_name == "Default") and mask_name:
+                    ref_layer = self.project.layer_by_name.get(mask_name)
+                    if ref_layer:
+                        layer_mat = getattr(ref_layer, 'material', '')
+                        if layer_mat and layer_mat != "Default":
+                            mat_name = layer_mat
+                # ========================================================
+
+                self.progress_update.emit(10 + int((i/total_steps)*80), f"Step {i+1}: {step.description}")
+
+                # --- 1. MASK GENERATION ---
+                # We need to find the layer object corresponding to the mask name
+                mask_2d = np.zeros((w_idx, h_idx), dtype=bool)
                 
+                if mask_name:
+                    # Find the layer geometry
+                    # In legacy mode, this is just the layer itself. 
+                    # In recipe mode, we look up the layer by name.
+                    target_layer = self.project.layer_by_name.get(mask_name)
+                    if target_layer:
+                        mask_2d = get_layer_mask(target_layer.name)
+                
+                # --- 2. LITHOGRAPHY (Adaptive) ---                
+                PHYSICAL_BLUR_UM = 0.15
+                MIN_VISUAL_PIXELS = 1.0                 
+                physical_sigma = PHYSICAL_BLUR_UM / res_xy                
+                final_sigma = max(physical_sigma, MIN_VISUAL_PIXELS)
+                
+                # Apply Blur only if mask exists
+                if np.any(mask_2d):
+                    blurred_mask = ndimage.gaussian_filter(
+                        mask_2d.astype(float), 
+                        sigma=final_sigma, 
+                        mode='constant'
+                    )
+                    mask_2d = (blurred_mask > 0.5)
+
                 if is_blanket:
                     mask_2d = np.zeros((w_idx, h_idx), dtype=bool)
-                    mask_2d[2:-2, 2:-2] = True
+                    mask_2d[2:-2, 2:-2] = True # Active everywhere
                 elif not np.any(mask_2d) and "dope" not in str(p_type): 
+                    # If mask is empty and it's not a global doping, skip
                     continue
 
-                self.progress_update.emit(10 + int((i/total_layers)*80), f"Step {i+1}: {layer.name}")
+                # ==========================================
+                # PHYSICS DISPATCHER
+                # ==========================================
 
                 # === PHYSICS: ETCH ===
-                if "etch" in str(p_type):
-                    d_val = getattr(layer, 'etch_depth_sim', t_val)
-                    depth_um = float(d_val) if d_val is not None else 1.0
-                    steps = max(1, int(depth_um / res_z))
+                if p_type == 'strip_resist':
+                    pr_mask = (volume == MatID.PHOTORESIST)
+                    volume[pr_mask] = MatID.AIR
+
+                elif p_type == 'etch_liftoff':
+                    print("--- RUNNING LIFT-OFF ---")
+                    is_resist = (volume == MatID.PHOTORESIST)
+                    count = np.count_nonzero(is_resist)
+                    if count == 0:
+                        print("FAIL: No Photoresist found to lift off.")
+                        continue
+
+                    resist_map_2d = np.any(is_resist, axis=2)
+                    cols = np.where(resist_map_2d)
                     
-                    if p_type == 'etch_iso':
-                        # Isotropic (Rounded)
+                    for x, y in zip(*cols):
+                        col = volume[x, y, :]
+                        r_indices = np.where(col == MatID.PHOTORESIST)[0]
+                        cut_height = r_indices[0]
+                        volume[x, y, cut_height:] = MatID.AIR
+                        
+                    print("Lift-off complete.")
+                
+                elif p_type == 'etch_cmp':
+                    is_solid = (volume != MatID.AIR)
+                    flipped_solid = is_solid[:, :, ::-1]
+                    depth_map = np.argmax(flipped_solid, axis=2)
+                    height_map = (z_idx - 1) - depth_map
+                    has_solid = np.any(is_solid, axis=2)
+                    height_map[~has_solid] = 0
+                    
+                    global_peak_z = np.max(height_map)
+                    remove_voxels = int(t_val / res_z)
+                    target_z_plane = max(SAFETY_FLOOR, global_peak_z - remove_voxels)
+                    
+                    if target_z_plane < z_idx:
+                        volume[:, :, target_z_plane+1 : ] = MatID.AIR
+
+                elif "etch" in str(p_type):
+                    steps = max(1, int(t_val / res_z))
+                    SAFETY_FLOOR = 1
+                    
+                    if is_blanket:
+                        for x in range(w_idx):
+                            for y in range(h_idx):
+                                col = volume[x, y, :]
+                                solids = np.where(col != MatID.AIR)[0]
+                                if len(solids) > 0:
+                                    top = solids[-1]
+                                    if top < SAFETY_FLOOR: continue
+                                    bottom = max(SAFETY_FLOOR, top - steps)
+                                    volume[x, y, bottom:top+1] = MatID.AIR
+
+                    elif p_type == 'etch_iso':
                         mask_3d = np.repeat(mask_2d[:, :, np.newaxis], z_idx, axis=2)
+                        acid_mask = (volume == MatID.AIR) & mask_3d
                         for _ in range(steps):
-                            air_mask = (volume == MatID.AIR)
-                            expanded_air = ndimage.binary_dilation(air_mask)
-                            target = expanded_air & (volume != MatID.AIR)
-                            volume[target & mask_3d] = MatID.AIR
-                    else:
-                        # Anisotropic (Vertical - Robust Loop)
+                            attack_zone = ndimage.binary_dilation(acid_mask)
+                            victim_material = attack_zone & (volume != MatID.AIR)
+                            volume[victim_material] = MatID.AIR
+                            acid_mask = acid_mask | victim_material
+
+                    elif p_type == 'etch_aniso':
                         cols = np.where(mask_2d)
                         for x, y in zip(*cols):
                             col = volume[x, y, :]
-                            # Find highest solid point
                             solids = np.where(col != MatID.AIR)[0]
                             if len(solids) > 0:
                                 top = solids[-1]
@@ -1697,152 +2097,192 @@ class SimulationWorker(QThread):
                 # === PHYSICS: OXIDATION ===
                 elif "ox" in str(p_type):
                     target_mat = MatID.SILICON_OXIDE
-                    
-                    # 1. DEFINE WHAT CAN BE OXIDIZED
-                    # Add any ID here that represents a generic Silicon material
                     OXIDIZABLE_MATS = [
-                        MatID.SILICON, 
-                        MatID.POLYSILICON, 
-                        MatID.SILICON_OXIDE, 
-                        MatID.SILICON_NITRIDE,
-                        MatID.ALUMINUM, 
-                        MatID.PHOTORESIST,
-                        MatID.SI_N_PHOS,    # N-Doped
-                        MatID.SI_P_BORON,   # P-Doped
-                        MatID.SI_N_ARSENIC,    # N-Doped
-                        MatID.SI_P_BF2,   # P-Doped
-                        MatID.POLY_N,       # Doped Poly (if you have it)
-                        MatID.POLY_P
+                        MatID.SILICON, MatID.POLYSILICON, MatID.SILICON_OXIDE, 
+                        MatID.SILICON_NITRIDE, MatID.ALUMINUM, MatID.PHOTORESIST,
+                        MatID.SI_N_PHOS, MatID.SI_P_BORON, MatID.SI_N_ARSENIC, 
+                        MatID.SI_P_BF2, MatID.POLY_N, MatID.POLY_P
                     ]
-
-                    # 2. FORCE VISIBILITY (Min 3 Voxels)
                     raw_voxels = int(t_val / res_z)
                     total_voxels = max(3, raw_voxels)
-                    
                     consume = int(total_voxels * 0.45)
                     grow = total_voxels - consume
-                    
-                    # Safety buffer to ignore the physical bottom of the wafer
-                    SAFETY_FLOOR = 10 
+                    SAFETY_FLOOR = 1
 
                     if p_type == 'ox_wet':
-                        # === WET OXIDATION (Isotropic) ===
-                        # 1. Identify "Oxidizable" voxels
+                        total_oxide = t_val * 2.22 
+                        grow_height_um = total_oxide - t_val
                         is_oxidizable = np.isin(volume, OXIDIZABLE_MATS)
                         is_air = (volume == MatID.AIR)
-                        
-                        # 2. Find Interface (Oxidizable touching Air)
-                        interface_mask = is_oxidizable & ndimage.binary_dilation(is_air)
-                        
-                        # 3. Apply Constraints
+                        surface_mask = is_oxidizable & ndimage.binary_dilation(is_air)
                         mask_3d = np.repeat(mask_2d[:,:,np.newaxis], z_idx, axis=2)
-                        valid_seed = interface_mask & mask_3d
-                        valid_seed[:, :, 0:SAFETY_FLOOR] = False # Protect Floor
+                        active_source = surface_mask & mask_3d
+                        active_source[:, :, 0:SAFETY_FLOOR] = False 
                         
-                        # 4. Execute
-                        if np.any(valid_seed):
-                            # Convert surface to Oxide
-                            volume[valid_seed] = target_mat
+                        if np.any(active_source):
+                            grid_calc = np.ones_like(volume, dtype=float)
+                            grid_calc[active_source] = 0.0
+                            target_pixels = 2.5
+                            if grow_height_um > 0:
+                                forced_res_xy = grow_height_um / target_pixels
+                                visual_res_xy = min(res_xy, forced_res_xy)
+                            else:
+                                visual_res_xy = res_xy * 0.1
                             
-                            # Swell loop
-                            current_oxide = (volume == target_mat)
-                            for _ in range(grow):
-                                # Grow into AIR
-                                expansion = ndimage.binary_dilation(current_oxide) & (volume == MatID.AIR)
-                                # Ensure we don't grow downwards into the safety floor
-                                expansion[:, :, 0:SAFETY_FLOOR] = False
-                                volume[expansion] = target_mat
-                                current_oxide = (volume == target_mat)
+                            dist_map = ndimage.distance_transform_edt(
+                                grid_calc, sampling=(visual_res_xy, visual_res_xy, res_z)
+                            )
+                            mask_consume = (dist_map <= t_val) & is_oxidizable
+                            mask_consume[:, :, 0:SAFETY_FLOOR] = False
+                            volume[mask_consume] = target_mat
+                            mask_grow = (dist_map <= grow_height_um) & is_air
+                            volume[mask_grow] = target_mat
 
                     else:
-                        # === DRY OXIDATION (Planar/Vertical) ===
+                        total_oxide_um = t_val * 2.22
+                        grow_height_um = total_oxide_um - t_val
+                        consume_vox = max(1, int(t_val / res_z))
+                        grow_vox = max(1, int(grow_height_um / res_z))
                         cols = np.where(mask_2d)
                         
                         for x, y in zip(*cols):
                             col = volume[x, y, :]
-                            
-                            # 1. Find indices of ANY solid material (not Air)
-                            # We search for the top of the stack, whatever it is.
                             solid_indices = np.where(col != MatID.AIR)[0]
-                            
                             if len(solid_indices) == 0: continue
-                            
-                            # 2. Identify the Topmost Material
                             top_z = solid_indices[-1]
                             top_material_id = col[top_z]
-                            
-                            # 3. CHECK: Is the top material allowed to oxidize?
-                            if top_material_id not in OXIDIZABLE_MATS:
-                                continue # It's metal, nitride, or photoresist -> Skip
-                                
-                            # 4. CHECK: Is it the bottom of the wafer?
+                            if top_material_id not in OXIDIZABLE_MATS: continue 
                             if top_z < SAFETY_FLOOR: continue
                             
-                            # 5. Apply Oxidation
-                            # Consume (Down)
-                            c_start = max(SAFETY_FLOOR, top_z - consume)
+                            c_start = max(SAFETY_FLOOR, top_z - consume_vox)
                             volume[x, y, c_start : top_z + 1] = target_mat
-                            
-                            # Grow (Up)
-                            g_end = min(z_idx, top_z + 1 + grow)
+                            g_end = min(z_idx, top_z + 1 + grow_vox)
                             volume[x, y, top_z + 1 : g_end] = target_mat
 
                 # === PHYSICS: DOPING ===
                 elif "dope" in str(p_type):
-                    if "boron" in layer.name.lower(): target_id = MatID.SI_P_BORON
-                    else: target_id = MatID.SI_N_PHOS
+                    SAFETY_FLOOR = 10 
                     
-                    Rp = max(0.01, t_val) # Range
-                    dRp = Rp * 0.35      # Straggle
+                    # Resolve Material from Params (Recipe Mode)
+                    raw_mat_name = str(mat_name).lower()
+                    raw_desc_txt = step.description.lower()                  
+                    if any(x in raw_mat_name for x in ['boron', 'bf2', 'p_type', 'pdoping', 'p-doping']):
+                        target_id = MatID.SI_P_BORON  
+                    elif any(x in raw_mat_name for x in ['arsenic', 'phos', 'n-type', 'n_type', 'ndoping']):
+                        target_id = MatID.SI_N_PHOS   
+                    else:
+                        target_id = MatID.SI_P_BORON
                     
-                    hosts = (volume == MatID.SILICON) | (volume == MatID.POLYSILICON)
-                    
-                    source_mask = np.ones_like(mask_2d) if getattr(layer, 'is_blanket_sim', False) else mask_2d
-                    surf_voxels = hosts & (~np.roll(hosts, -1, axis=2))
-                    mask_3d = np.repeat(source_mask[:,:,np.newaxis], z_idx, axis=2)
-                    active_surf = surf_voxels & mask_3d
-                    active_surf[:,:,0] = False
-                    
+                    hosts = (volume != MatID.AIR)
+                    is_air = (volume == MatID.AIR)
+                    surface_mask = hosts & ndimage.binary_dilation(is_air)
+                    mask_3d = np.repeat(mask_2d[:,:,np.newaxis], z_idx, axis=2)
+                    active_surf = surface_mask & mask_3d
+                    active_surf[:, :, 0:SAFETY_FLOOR] = False
+
                     if np.any(active_surf):
-                        grid = np.ones_like(volume, dtype=float)
-                        grid[active_surf] = 0
-                        # Anisotropic Distance Field
-                        dist = ndimage.distance_transform_edt(grid, sampling=(res_xy, res_xy, res_z))
-                        conc = np.exp(-((dist - Rp)**2)/(2*dRp**2))
-                        
-                        mask_doped = (conc > 0.01) & hosts
-                        volume[mask_doped] = target_id
-                        
-                        if not hasattr(self, 'conc_map'): self.conc_map = {}
-                        self.conc_map[target_id] = conc
+                        if "anneal" in str(p_type):
+                            sigma_voxel = t_val / res_z                             
+                            DOPING_IDS = [MatID.SI_N_PHOS, MatID.SI_P_BORON, MatID.SI_N_ARSENIC, MatID.SI_P_BF2]
+                            for target_id in DOPING_IDS:
+                                doping_mask = (volume == target_id)
+                                if not np.any(doping_mask): continue
+                                blurred_mask = ndimage.gaussian_filter(doping_mask.astype(float), sigma=sigma_voxel, mode='constant')
+                                new_doping_mask = (blurred_mask > 0.01)
+                                volume[doping_mask] = MatID.SILICON
+                                volume[new_doping_mask] = target_id
+                                volume[(volume != target_id) & (volume == MatID.AIR)] = MatID.AIR
+                                volume[(volume != target_id) & (volume == MatID.ALUMINUM)] = MatID.ALUMINUM
+
+                        elif "diff" in str(p_type) or "drive" in str(p_type):
+                            grid_calc = np.ones_like(volume, dtype=float)
+                            grid_calc[active_surf] = 0.0
+                            TARGET_PIXELS = 3.0
+                            visual_res_xy = min(res_xy, t_val / TARGET_PIXELS) if t_val > 0 else res_xy * 0.1
+                            dist_map = ndimage.distance_transform_edt(grid_calc, sampling=(visual_res_xy, visual_res_xy, res_z))
+                            mask_doped = (dist_map <= t_val) & hosts
+                            volume[mask_doped] = target_id
+
+                        else:
+                            Rp = max(0.05, t_val)
+                            Straggle = max(0.02, Rp * 0.3)
+                            peak_vox_depth = int(Rp / res_z)
+                            spread_vox = max(1, int(Straggle / res_z))
+                            cols = np.where(mask_2d)
+                            for x, y in zip(*cols):
+                                col = volume[x, y, :]
+                                solid_indices = np.where(col != MatID.AIR)[0]
+                                if len(solid_indices) == 0: continue
+                                top_z = solid_indices[-1]
+                                if top_z < SAFETY_FLOOR: continue
+                                center_z = top_z - peak_vox_depth
+                                start_z = max(SAFETY_FLOOR, center_z - spread_vox)
+                                end_z = min(top_z, center_z + spread_vox)
+                                if start_z < end_z:
+                                    volume[x, y, start_z : end_z+1] = target_id
 
                 # === PHYSICS: DEPOSITION ===
-                else: # Deposition
+                else:
+                    # 1. Prepare Strings
+                    mat_txt = str(mat_name).lower()
+                    desc_txt = step.description.lower()
+                    
+                    # 2. HIERARCHY OF CHECKS
+                    # A. Photoresist
+                    if "resist" in mat_txt or "resist" in desc_txt:
+                        mid = MatID.PHOTORESIST
+                        
+                    # B. Metals
+                    elif "aluminum" in mat_txt or "metal" in mat_txt or "copper" in mat_txt:
+                        mid = MatID.ALUMINUM
+
+                    # C. Doped Silicon (Epitaxy)
+                    elif any(x in mat_txt for x in ['boron', 'p-type', 'p_type', 'pdoping', 'p-doping']):
+                        mid = MatID.SI_P_BORON
+                        
+                    elif any(x in mat_txt for x in ['phos', 'arsen', 'n-type', 'n_type', 'ndoping']):
+                        mid = MatID.SI_N_PHOS
+
+                    # D. Dielectrics
+                    elif "nitride" in mat_txt:
+                        mid = MatID.SILICON_NITRIDE
+                    elif "oxide" in mat_txt:
+                        mid = MatID.SILICON_OXIDE
+                        
+                    # E. Silicon Types
+                    elif "poly" in mat_txt:
+                        mid = MatID.POLYSILICON
+                    elif "silicon" in mat_txt or "si" == mat_txt or "default" in mat_txt:
+                        mid = MatID.SILICON
+                        
+                    # 3. Final Fallback
+                    else:
+                        # Try dictionary
+                        found_id = MAT_NAME_TO_ID.get(mat_name)
+                        if found_id is not None:
+                            mid = found_id
+                        else:
+                            mid = MatID.SILICON_OXIDE
+                    
                     steps = max(1, int(t_val / res_z))
                     
-                    # Planar Deposition (Extrusion)
                     if p_type == 'depo_planar':
                         mask_3d = np.repeat(mask_2d[:, :, np.newaxis], z_idx, axis=2)
                         solid = (volume != MatID.AIR)
-                        # Find top surface
                         surf = solid & (~np.roll(solid, -1, axis=2))
                         surf[:,:,0] = False
                         
                         for _ in range(steps):
-                            depo = np.roll(surf, 1, axis=2) # Move up
+                            depo = np.roll(surf, 1, axis=2)
                             depo[:,:,0] = False
-                            # Fill ONLY where mask exists and is currently Air
                             target = depo & mask_3d & (volume == MatID.AIR)
                             volume[target] = mid
-                            surf = target # New surface is the layer we just added
+                            surf = target
                     
-                    # Conformal Deposition (Growth)
                     else: 
                         for _ in range(steps):
                             solid = (volume != MatID.AIR)
-                            # Grow solid into air
                             target = ndimage.binary_dilation(solid) & (volume == MatID.AIR)
-                            # Mask it
                             mask_3d = np.repeat(mask_2d[:,:,np.newaxis], z_idx, axis=2)
                             volume[target & mask_3d] = mid
 
@@ -1905,6 +2345,18 @@ class ThreeDViewDialog(QDialog):
         self.slice_container = self.create_slice_view()
         self.slice_container.setVisible(False) # Hidden until data exists
         self.splitter.addWidget(self.slice_container)
+        # --- MEASUREMENT STATE ---
+        self.measure_mode = False
+        self.measure_p1 = None # Stores first click (x, z)
+        
+        # Visual Item for the Ruler Line (Yellow dashed line)
+        self.ruler_line = pg.PlotCurveItem(pen=pg.mkPen('y', width=2, style=Qt.DashLine))
+        self.slice_plot.addItem(self.ruler_line)
+        self.ruler_line.setVisible(False)
+        
+        # Connect Mouse Click Event
+        # We listen to the "Scene" to get clicks anywhere on the plot
+        self.slice_plot.scene().sigMouseClicked.connect(self.on_slice_clicked)
 
         # Overlays
         self.setup_floating_legend()
@@ -2007,84 +2459,180 @@ class ThreeDViewDialog(QDialog):
     def create_slice_view(self):
         widget = QWidget()
         layout = QHBoxLayout(widget)
-        layout.setContentsMargins(0, 5, 0, 0)
+        layout.setContentsMargins(5, 5, 5, 5) # Small padding
+        layout.setSpacing(10)
         
-        # 1. Plot Area
+        # 1. Plot Area (The Chart)
         self.slice_plot = pg.PlotWidget(title="Virtual Cross-Section")
         self.slice_plot.setLabel('left', 'Depth (Z)', units='um')
         self.slice_plot.setLabel('bottom', 'Position', units='um')
-        self.slice_plot.setAspectLocked(False) # We lock it manually via ImageItem scaling
+        self.slice_plot.setAspectLocked(False)
         self.slice_plot.invertY(False)
         self.slice_plot.setBackground('#202020')
-        
         self.slice_img = pg.ImageItem()
         self.slice_plot.addItem(self.slice_img)
-        layout.addWidget(self.slice_plot, stretch=4)
         
-        # 2. Controls Area
-        ctrl = QFrame()
-        ctrl.setFixedWidth(250)
-        ctrl.setStyleSheet("background-color: #2b2b2b; border-radius: 5px; padding: 5px;")
-        v_lay = QVBoxLayout(ctrl)
+        # Give the plot 70% of the width
+        layout.addWidget(self.slice_plot, stretch=7)
         
-        v_lay.addWidget(QLabel("<b style='color:white'>Cut Plane</b>"))
+        # 2. Controls Area (Sidebar)
+        # Instead of a fixed QFrame, we use a widget with a layout
+        ctrl_panel = QWidget()
+        ctrl_layout = QVBoxLayout(ctrl_panel)
+        ctrl_layout.setContentsMargins(0, 0, 0, 0)
+        ctrl_layout.setSpacing(10) # Nice gap between groups
         
-        self.rb_x = QRadioButton("X-Axis (Front View)")
-        self.rb_x.setStyleSheet("color: white;")
+        # --- Group 1: Slice Control ---
+        grp_slice = QGroupBox("Cut Plane")
+        grp_slice.setStyleSheet("QGroupBox { color: #ddd; }")
+        l_slice = QVBoxLayout(grp_slice)
+        
+        self.rb_x = QRadioButton("X-Axis (Front)")
         self.rb_x.setChecked(True)
         self.rb_x.toggled.connect(self.update_slice_view)
         
-        self.rb_y = QRadioButton("Y-Axis (Side View)")
-        self.rb_y.setStyleSheet("color: white;")
+        self.rb_y = QRadioButton("Y-Axis (Side)")
         
         bg = QButtonGroup(self)
-        bg.addButton(self.rb_x)
-        bg.addButton(self.rb_y)
+        bg.addButton(self.rb_x); bg.addButton(self.rb_y)
         
-        v_lay.addWidget(self.rb_x)
-        v_lay.addWidget(self.rb_y)
+        l_slice.addWidget(self.rb_x)
+        l_slice.addWidget(self.rb_y)
         
-        v_lay.addWidget(QLabel("<br><b style='color:white'>Slice Position</b>"))
+        # Slider & Label
+        l_slice.addWidget(QLabel("Slice Position:"))
         self.slider_slice = QSlider(Qt.Horizontal)
         self.slider_slice.valueChanged.connect(self.update_slice_view)
-        v_lay.addWidget(self.slider_slice)
+        l_slice.addWidget(self.slider_slice)
         
         self.lbl_slice_pos = QLabel("0.00 um")
-        self.lbl_slice_pos.setStyleSheet("color: #00FF7F; font-size: 14px; font-weight: bold;")
         self.lbl_slice_pos.setAlignment(Qt.AlignCenter)
-        v_lay.addWidget(self.lbl_slice_pos)
+        self.lbl_slice_pos.setStyleSheet("color: #00FF7F; font-weight: bold;")
+        l_slice.addWidget(self.lbl_slice_pos)
         
-        v_lay.addStretch()
-        btn_save_slice = QPushButton("Save 2D Image")
-        btn_save_slice.setStyleSheet("background-color: #4682B4; color: white;")
-        btn_save_slice.clicked.connect(self.save_slice_snapshot)
-        v_lay.addWidget(btn_save_slice)
-        layout.addWidget(ctrl, stretch=1)
+        ctrl_layout.addWidget(grp_slice)
+        
+        # --- Group 2: Measurement ---
+        grp_meas = QGroupBox("Measurement")
+        grp_meas.setStyleSheet("QGroupBox { font-weight: bold; color: #ddd; }")
+        l_meas = QVBoxLayout(grp_meas)
+        
+        self.btn_measure = QPushButton("Ruler Tool")
+        self.btn_measure.setCheckable(True)
+        self.btn_measure.setStyleSheet("""
+            QPushButton { background-color: #444; color: white; border: 1px solid #666; padding: 6px; border-radius: 4px; }
+            QPushButton:checked { background-color: #d4aa00; color: black; }
+            QPushButton:hover { background-color: #555; }
+        """)
+        self.btn_measure.toggled.connect(self.toggle_measure_mode)
+        l_meas.addWidget(self.btn_measure)
+        
+        self.lbl_measure_result = QLabel("--")
+        self.lbl_measure_result.setAlignment(Qt.AlignCenter)
+        self.lbl_measure_result.setStyleSheet("color: #FFD700; font-size: 11px;")
+        l_meas.addWidget(self.lbl_measure_result)
+        
+        ctrl_layout.addWidget(grp_meas)
+        
+        # Spacer to push Save button to bottom
+        ctrl_layout.addStretch()
+        
+        # --- Save Button ---
+        btn_save = QPushButton("Save Image")
+        btn_save.setStyleSheet("""
+            QPushButton { background-color: #4682B4; color: white; padding: 8px; font-weight: bold; border-radius: 4px; }
+            QPushButton:hover { background-color: #5A9BD3; }
+        """)
+        btn_save.clicked.connect(self.save_slice_snapshot)
+        ctrl_layout.addWidget(btn_save)
+        
+        # Give the controls 30% of the width, but allow it to shrink/grow
+        # Setting a Max Width prevents it from getting weirdly wide on large screens
+        ctrl_panel.setMaximumWidth(300)
+        ctrl_panel.setMinimumWidth(200)
+        
+        layout.addWidget(ctrl_panel, stretch=3)
         
         return widget
 
+    def toggle_measure_mode(self, checked):
+        self.measure_mode = checked
+        self.measure_p1 = None # Reset points
+        self.ruler_line.setVisible(False)
+        
+        if checked:
+            self.btn_measure.setText("Ruler Tool: ON")
+            self.btn_measure.setStyleSheet("background-color: #d4aa00; color: black;")
+            self.slice_plot.setCursor(Qt.CrossCursor)
+            self.lbl_measure_result.setText("Click Start Point...")
+        else:
+            self.btn_measure.setText("Ruler Tool: OFF")
+            self.btn_measure.setStyleSheet("background-color: #555; color: white;")
+            self.slice_plot.setCursor(Qt.ArrowCursor)
+            self.lbl_measure_result.setText("Dist: --")
+
+    def on_slice_clicked(self, event):
+        if not self.measure_mode: return
+        
+        vb = self.slice_plot.plotItem.vb
+        scene_coords = event.scenePos()
+        
+        if self.slice_plot.sceneBoundingRect().contains(scene_coords):
+            mouse_point = vb.mapSceneToView(scene_coords)
+            x_um = mouse_point.x()
+            z_um = mouse_point.y()
+            
+            if self.measure_p1 is None:
+                # STATE 1: Start
+                self.measure_p1 = (x_um, z_um)
+                self.lbl_measure_result.setText("Click End Point...")
+                self.ruler_line.setData([x_um], [z_um])
+                self.ruler_line.setVisible(True)
+            else:
+                # STATE 2: End
+                x1, z1 = self.measure_p1
+                x2, z2 = x_um, z_um
+                
+                dx = abs(x2 - x1)
+                dz = abs(z2 - z1)
+                dist = np.sqrt(dx**2 + dz**2)
+                
+                # COMPACT FORMAT: "L: 10.5 (dx: 8.0, dz: 5.0)"
+                self.lbl_measure_result.setText(
+                    f"Len: {dist:.2f} µm\n(dx: {dx:.1f}, dz: {dz:.1f})"
+                )
+                
+                self.ruler_line.setData([x1, x2], [z1, z2])
+                self.measure_p1 = None
+
     def save_slice_snapshot(self):
-        try:
-            # 1. Grab the generic QPixmap of the PlotWidget
-            # This works on any Qt widget (buttons, layouts, plots)
-            pixmap = self.slice_plot.grab()
-            
-            # 2. Save to file
-            filename = "cross_section.png"
-            pixmap.save(filename)
-            
-            # 3. Update Status
-            self.lbl_status.setText(f"Saved {filename}")
-            
-            # Optional: Flash the border to give visual feedback
-            self.slice_plot.setStyleSheet("border: 2px solid #00FF00;")
-            QApplication.processEvents()
-            import time; time.sleep(0.1)
-            self.slice_plot.setStyleSheet("")
-            
-        except Exception as e:
-            self.lbl_status.setText(f"Save Error: {str(e)}")
-            print(f"Error saving slice: {e}")
+        # 1. Open File Dialog so you know where it saves
+        options = QFileDialog.Options()
+        fileName, _ = QFileDialog.getSaveFileName(
+            self, 
+            "Save Cross-Section Image", 
+            "cross_section.png", 
+            "PNG Files (*.png);;All Files (*)", 
+            options=options
+        )
+
+        if fileName:
+            try:
+                # 2. Use the High-Quality Exporter
+                # This is better than .grab() because it ignores window borders/scrollbars
+                exporter = pg.exporters.ImageExporter(self.slice_plot.plotItem)
+                
+                # Optional: Force High Resolution (e.g., 1920px wide)
+                # You can remove this line to save at current screen resolution
+                exporter.parameters()['width'] = 1920
+                
+                # 3. Save
+                exporter.export(fileName)
+                self.lbl_status.setText(f"Saved: {fileName}")
+                
+            except Exception as e:
+                self.lbl_status.setText(f"Error saving: {str(e)}")
+                print(f"Export Error: {e}")
 
     def setup_floating_legend(self):
         self.legend_overlay = QWidget(self.gl_view) 
@@ -2125,10 +2673,10 @@ class ThreeDViewDialog(QDialog):
         self.btn_run.setEnabled(True)
 
     def on_finished(self, volume, spacing, offset, conc_map):
-        self.lbl_status.setText("Generating Meshes...")
+        self.lbl_status.setText("Meshing...")
         QApplication.processEvents()
         
-        # Store Data
+        # Save state for Cross-Section View
         self.volume_data = volume
         self.spacing = spacing
         self.offset = offset
@@ -2138,121 +2686,141 @@ class ThreeDViewDialog(QDialog):
         min_x, min_y = offset
         unique_ids = np.unique(volume)
         
+        # Calculate Center for camera positioning
         vol_w_um = volume.shape[0] * res_x
         vol_h_um = volume.shape[1] * res_y
         center_x = min_x + vol_w_um / 2.0
         center_y = min_y + vol_h_um / 2.0
 
+        # --- Helper: High Contrast Color Logic ---
         def get_style(mid):
-            name = "Silicon"
-            for n, id_val in MAT_NAME_TO_ID.items():
-                if id_val == mid: name = n; break
-            if mid == MatID.POLY_N: name = "Phosphorus Doped"
-            if mid == MatID.POLY_P: name = "Boron Doped"
-            rgb = MATERIAL_DB.get(name, (0.5,0.5,0.5))
-            return rgb[0], rgb[1], rgb[2], 1.0
+            # 1. Default Grey
+            rgb = (0.5, 0.5, 0.5)
+            alpha = 1.0
+
+            # 2. Reverse Lookup (ID -> Name -> DB)
+            mat_name = None
+            for name, id_val in MAT_NAME_TO_ID.items():
+                if id_val == mid:
+                    mat_name = name
+                    break
+            
+            if mat_name and mat_name in MATERIAL_DB:
+                rgb = MATERIAL_DB[mat_name]
+
+            # 3. EXPLICIT OVERRIDES (Visual Clarity)
+            # Metals (Bright Silver)
+            if mid == MatID.ALUMINUM: 
+                rgb = (0.9, 0.9, 1.0)
+            
+            # Substrate (Dark Blue-Grey)
+            elif mid == MatID.SILICON: 
+                rgb = (0.2, 0.2, 0.3)
+            
+            # Photoresist (Red)
+            elif mid == MatID.PHOTORESIST:
+                rgb = (0.9, 0.2, 0.2)
+
+            # Dopants (Neon Colors)
+            elif mid in [MatID.SI_N_PHOS, MatID.SI_N_ARSENIC, MatID.POLY_N]:
+                rgb = (0.0, 1.0, 0.0) # Green
+            elif mid in [MatID.SI_P_BORON, MatID.SI_P_BF2, MatID.POLY_P]:
+                rgb = (1.0, 0.5, 0.0) # Orange
+
+            return rgb[0], rgb[1], rgb[2], alpha
 
         silicon_mesh = None
         other_meshes = []
 
-        # --- MESH GENERATION ---
+        # --- MESH GENERATION LOOP ---
         for uid in unique_ids:
             if uid == MatID.AIR: continue
             
-            # Special Handling for Silicon (Hollow shell)
+            # 1. HEAL SILICON (Patch doping holes so substrate looks solid)
             display_vol = volume
             if uid == MatID.SILICON:
                 display_vol = volume.copy()
-                display_vol[(volume != MatID.AIR) & (volume != MatID.SILICON)] = MatID.SILICON
-
-            mesh = None
-            is_gradient = False
-            is_silicon = (uid == MatID.SILICON)
+                doping_ids = [
+                    MatID.SI_N_PHOS, MatID.SI_P_BORON, MatID.SI_P_BF2,
+                    MatID.SI_N_ARSENIC, MatID.POLY_N, MatID.POLY_P
+                ]
+                patch_mask = np.isin(volume, doping_ids)
+                display_vol[patch_mask] = MatID.SILICON
             
-            verts = faces = normals = colors = None
-
-            if uid in conc_map:
-                # --- GRADIENT MESH (Doping Fix) ---
-                scalar = conc_map[uid]
-                try:
-                    # 1. Grid Indices
-                    verts, faces, normals, _ = measure.marching_cubes(scalar, 0.1)
-                    
-                    # 2. Safe Color Lookup
-                    vx = np.clip(verts[:,0].astype(int), 0, scalar.shape[0]-1)
-                    vy = np.clip(verts[:,1].astype(int), 0, scalar.shape[1]-1)
-                    vz = np.clip(verts[:,2].astype(int), 0, scalar.shape[2]-1)
-                    vals = scalar[vx, vy, vz]
-                    
-                    # 3. Apply Spacing
-                    verts[:,0] *= res_x; verts[:,1] *= res_y; verts[:,2] *= res_z
-
-                    # 4. Color Array
-                    r, g, b, _ = get_style(uid)
-                    colors = np.zeros((len(verts), 4), dtype=np.float32)
-                    colors[:,0]=r; colors[:,1]=g; colors[:,2]=b
-                    colors[:,3] = np.clip(vals, 0.2, 0.9)
-                    is_gradient = True
-                except: continue
-            else:
-                # --- SOLID MESH (Visibility Fix) ---
-                # Use Sigma=0 and Level=0.1 to catch thin layers
-                mat_vol = (display_vol == uid).astype(float)
-                try:
-                    verts, faces, normals, _ = measure.marching_cubes(mat_vol, 0.1, spacing=spacing)
-                    r, g, b, _ = get_style(uid)
-                    colors = (r, g, b, 1.0)
-                except: continue
-
-            # Apply Center Offset
-            verts[:,0] += (min_x - center_x)
-            verts[:,1] += (min_y - center_y)
+            # 2. SMOOTHING
+            # Disable smoothing for doping so it stays sharp/blocky if needed
+            sigma = 0.2 if uid not in [MatID.SI_N_PHOS, MatID.SI_P_BORON] else 0.0
             
-            # Create GL Item
-            if is_gradient:
+            mat_vol = (display_vol == uid).astype(float)
+            if sigma > 0: mat_vol = gaussian_filter(mat_vol, sigma)
+            
+            try:
+                # 3. MARCHING CUBES (Generate Geometry)
+                # Level 0.1 ensures even thin layers are caught
+                verts, faces, normals, _ = measure.marching_cubes(mat_vol, 0.1, spacing=spacing)
+                
+                # --- FIX: DATA SANITIZATION (Prevents OpenGL Crash) ---
+                if len(verts) == 0 or len(faces) == 0: continue
+
+                # Force specific types for OpenGL drivers
+                verts = verts.astype(np.float32)
+                normals = normals.astype(np.float32)
+                faces = faces.astype(np.int32)
+
+                # Force contiguous memory
+                verts = np.ascontiguousarray(verts)
+                normals = np.ascontiguousarray(normals)
+                faces = np.ascontiguousarray(faces)
+                # -----------------------------------------------------
+                
+                # Apply Offset
+                verts[:,0] += (min_x - center_x)
+                verts[:,1] += (min_y - center_y)
+                
+                # Get Color
+                r, g, b, a = get_style(uid)
+                colors = (r, g, b, a)
+                
+                # Create GL Item
                 mesh = gl.GLMeshItem(
-                    vertexes=verts, faces=faces.astype(int), normals=normals,
-                    vertexColors=colors, smooth=True, shader='shaded', glOptions='translucent'
+                    vertexes=verts,
+                    faces=faces,
+                    normals=normals,
+                    color=colors,
+                    smooth=True,
+                    shader='shaded',
+                    glOptions='opaque'
                 )
-                mesh._orig_colors_array = colors
-            else:
-                mesh = gl.GLMeshItem(
-                    vertexes=verts, faces=faces.astype(int), normals=normals,
-                    color=colors, smooth=True, shader='shaded', glOptions='opaque'
-                )
+                
+                # Tag metadata for transparency toggle
                 mesh._orig_color_tuple = colors
+                mesh._is_silicon = (uid == MatID.SILICON)
+                mesh._is_doping = (uid in [MatID.SI_N_PHOS, MatID.SI_P_BORON, MatID.SI_N_ARSENIC, MatID.POLY_N, MatID.POLY_P])
+                
+                if mesh._is_silicon: silicon_mesh = mesh
+                else: other_meshes.append(mesh)
 
-            mesh._is_silicon = is_silicon
-            mesh._is_gradient = is_gradient
-            
-            if is_silicon: silicon_mesh = mesh
-            else: other_meshes.append(mesh)
+            except Exception as e:
+                print(f"Meshing failed for ID {uid}: {e}")
+                continue
 
         # Add to Scene
         for m in other_meshes: 
             self.gl_view.addItem(m)
             self.generated_meshes.append(m)
+            
         if silicon_mesh: 
             self.gl_view.addItem(silicon_mesh)
             self.generated_meshes.append(silicon_mesh)
 
-        # Update Views
+        # Final UI Updates
         self.toggle_transparency(self.chk_translucent.isChecked())
         self.update_z_scale()
-        self.toggle_wireframe(self.chk_wireframe.isChecked())
         
-        # Initialize Cross Section
-        max_idx = max(volume.shape[0], volume.shape[1])
-        self.slider_slice.setRange(0, max_idx - 1)
-        self.slider_slice.setValue(int(volume.shape[0]/2))
         self.slice_container.setVisible(True)
         self.update_slice_view()
-
-        # Reset Cam if first run
-        max_dim = max(vol_w_um, vol_h_um)
-        self.gl_view.setCameraPosition(distance=max_dim * 1.5, elevation=30, azimuth=-45)
         
-        self.lbl_status.setText("Ready.")
+        self.lbl_status.setText("Complete.")
         self.progress.setVisible(False)
         self.btn_run.setEnabled(True)
 
@@ -2260,111 +2828,136 @@ class ThreeDViewDialog(QDialog):
     # LOGIC: VISUAL UPDATES
     # ==========================
     def update_slice_view(self):
-        """Generates the 2D Cross Section Image."""
         if self.volume_data is None: return
         
-        idx = self.slider_slice.value()
+        # --- FIX: DYNAMIC SLIDER RANGE ---
+        # 1. Determine the max index for the current axis
+        # shape is (Width, Height, Depth)
+        if self.rb_x.isChecked():
+            # Cutting X-Axis (Front View) -> iterating through Width indices
+            max_slice_idx = self.volume_data.shape[0] - 1
+        else:
+            # Cutting Y-Axis (Side View) -> iterating through Height indices
+            max_slice_idx = self.volume_data.shape[1] - 1
+            
+        # 2. Update the slider bounds
+        # We block signals briefly to prevent recursion if the value changes
+        self.slider_slice.blockSignals(True)
+        self.slider_slice.setMaximum(max_slice_idx)
+        
+        # 3. Clamp the current value 
+        # (e.g., if we were at pos 500, but new axis max is 300, drop to 300)
+        current_val = self.slider_slice.value()
+        if current_val > max_slice_idx:
+            self.slider_slice.setValue(max_slice_idx)
+            current_val = max_slice_idx
+        self.slider_slice.blockSignals(False)
+        
+        # ---------------------------------------------------------
+        
+        # 4. Get Slice Data (using clamped value)
+        idx = current_val
         res_x, res_y, res_z = self.spacing
         
-        # 1. Determine Axis and Data Slice
-        # Shape: (Width, Height, Depth)
         if self.rb_x.isChecked():
-            # Front View (Cut X, Show Y vs Z)
-            max_idx = self.volume_data.shape[0] - 1
-            idx = min(idx, max_idx)
             slice_dat = self.volume_data[idx, :, :]
-            width_axis_len = slice_dat.shape[0] * res_y
-            pos_label = f"X = {(self.offset[0] + idx*res_x):.2f} um"
-            scale_x = res_y
+            scale_x = res_y 
+            lbl_pos = f"X = {(self.offset[0] + idx*res_x):.2f} um"
         else:
-            # Side View (Cut Y, Show X vs Z)
-            max_idx = self.volume_data.shape[1] - 1
-            idx = min(idx, max_idx)
             slice_dat = self.volume_data[:, idx, :]
-            width_axis_len = slice_dat.shape[0] * res_x
-            pos_label = f"Y = {(self.offset[1] + idx*res_y):.2f} um"
             scale_x = res_x
+            lbl_pos = f"Y = {(self.offset[1] + idx*res_y):.2f} um"
 
-        self.lbl_slice_pos.setText(pos_label)
+        self.lbl_slice_pos.setText(lbl_pos)
 
-        # 2. Build RGB Image
-        # Create empty RGB array: (Width, Height, 3)
+        # 5. Build RGB Image (ID -> Color)
         rgb_img = np.zeros((slice_dat.shape[0], slice_dat.shape[1], 3), dtype=np.uint8)
+        unique_ids = np.unique(slice_dat)
         
-        unique_slice_ids = np.unique(slice_dat)
-        for uid in unique_slice_ids:
+        # Create Reverse Lookup
+        id_to_name = {v: k for k, v in MAT_NAME_TO_ID.items()}
+        
+        for uid in unique_ids:
             if uid == MatID.AIR: continue
             
-            # Map ID to Name
-            name = "Silicon"
-            for n, id_val in MAT_NAME_TO_ID.items():
-                if id_val == uid: name = n; break
+            # A. Get Base RGB
+            mat_name = id_to_name.get(uid, "Silicon")
+            base_rgb = MATERIAL_DB.get(mat_name, (0.5, 0.5, 0.5))
+            
+            # B. Special Color Overrides
+            if uid in [MatID.SI_N_PHOS, MatID.SI_N_ARSENIC, MatID.POLY_N]:
+                base_rgb = (0.0, 1.0, 0.0) # Bright Green
+            elif uid in [MatID.SI_P_BORON, MatID.SI_P_BF2, MatID.POLY_P]:
+                base_rgb = (1.0, 0.5, 0.0) # Bright Orange
+            elif uid == MatID.SILICON:
+                base_rgb = (0.2, 0.2, 0.25)
+            elif uid == MatID.ALUMINUM:
+                base_rgb = (0.85, 0.85, 1.0)
                 
-            # Treat Doping ID as Silicon Color Base
-            if uid == MatID.SI_N_PHOS or uid == MatID.SI_P_BORON: 
-                name = "Silicon"
-            
-            base_rgb = MATERIAL_DB.get(name, (0.5, 0.5, 0.5))
             c_int = (int(base_rgb[0]*255), int(base_rgb[1]*255), int(base_rgb[2]*255))
-            
-            # Paint pixels
-            mask = (slice_dat == uid)
-            rgb_img[mask] = c_int
+            rgb_img[slice_dat == uid] = c_int
 
-        # 3. Doping Overlay (Tint)
-        # If the slice cuts through a doping map
+        # 6. Apply Doping Overlay
         for uid, conc_vol in self.conc_map.items():
             if self.rb_x.isChecked(): conc_slice = conc_vol[idx, :, :]
             else: conc_slice = conc_vol[:, idx, :]
             
-            # Mask where concentration is significant
             mask_dope = (conc_slice > 0.05)
             if np.any(mask_dope):
-                # Tint Color: Red for Boron/P-Type, Green for Phos/N-Type
-                is_boron = "BORON" in str(uid) or "P" in str(uid)
+                is_boron = uid in [MatID.SI_P_BORON, MatID.SI_P_BF2, MatID.POLY_P]
                 tint = np.array([255, 50, 50]) if is_boron else np.array([50, 255, 50])
                 
-                # Blend: 60% Base + 40% Tint
                 roi = rgb_img[mask_dope].astype(float)
                 blended = roi * 0.6 + tint * 0.4
-                rgb_img[mask_dope] = blended.astype(np.uint8)
+                rgb_img[mask_dope] = np.clip(blended, 0, 255).astype(np.uint8)
 
-        # 4. Update Image Item with Aspect Ratio Correction
+        # 7. Update View
+        self.slice_img.setImage(rgb_img, autoLevels=False, levels=None)
         
-        self.slice_img.setImage(rgb_img, autoLevels=False)
-        self.slice_img.resetTransform()
+        tr = QTransform()
+        tr.scale(scale_x, res_z)
+        self.slice_img.setTransform(tr)
         
-        # CRITICAL: Scale X by XY-Res and Y by Z-Res to look physically correct
-        self.slice_img.scale(scale_x, res_z)
-        
-        # Set View Limits
-        self.slice_plot.setXRange(0, width_axis_len)
-        self.slice_plot.setYRange(0, slice_dat.shape[1] * res_z)
+        # Fit View (Optional: You can remove this if you want to allow zooming)
+        # It resets the zoom every time the slider moves.
+        width_len = slice_dat.shape[0] * scale_x
+        height_len = slice_dat.shape[1] * res_z
+        self.slice_plot.setXRange(0, width_len)
+        self.slice_plot.setYRange(0, height_len)
 
     def toggle_transparency(self, checked):
         for m in self.generated_meshes:
-            # Silicon
+            c = m._orig_color_tuple
+            
+            # CASE 1: Silicon Substrate (Make it Glass)
             if getattr(m, '_is_silicon', False):
-                c = m._orig_color_tuple
                 if checked:
+                    # Very transparent (Alpha 0.15) + Additive blending makes it look like glass
                     m.setColor((c[0], c[1], c[2], 0.15))
                     m.setGLOptions('additive')
                 else:
                     m.setColor((c[0], c[1], c[2], 1.0))
                     m.setGLOptions('opaque')
-            # Gradient
-            elif getattr(m, '_is_gradient', False):
-                colors = m._orig_colors_array.copy()
-                if not checked: colors[:, 3] = 1.0
-                m.meshData.setVertexColors(colors)
-                m.meshDataChanged()
-                m.setGLOptions('translucent' if checked else 'opaque')
-            # Standard
+            
+            # CASE 2: Doping (Make it Glow inside the Glass)
+            elif getattr(m, '_is_doping', False):
+                if checked:
+                    # Doping stays mostly solid so you can see it inside the substrate
+                    m.setColor((c[0], c[1], c[2], 0.8))
+                    m.setGLOptions('translucent')
+                else:
+                    m.setColor((c[0], c[1], c[2], 1.0))
+                    m.setGLOptions('opaque')
+                    
+            # CASE 3: Everything else (Oxide, Metal)
             else:
-                c = m._orig_color_tuple
-                a = 0.6 if checked else 1.0
-                m.setColor((c[0], c[1], c[2], a))
-                m.setGLOptions('translucent' if checked else 'opaque')
+                if checked:
+                    m.setColor((c[0], c[1], c[2], 0.5))
+                    m.setGLOptions('translucent')
+                else:
+                    m.setColor((c[0], c[1], c[2], 1.0))
+                    m.setGLOptions('opaque')
+                    
         self.gl_view.update()
 
     def update_z_scale(self):
@@ -2375,18 +2968,29 @@ class ThreeDViewDialog(QDialog):
             m.scale(1,1,s)
 
     def toggle_wireframe(self, checked):
-        # Set polygon mode to Line (1) or Fill (2)
-        mode = 'line' if checked else 'fill'
+        """
+        Switches between Solid Mode (Faces ON, Edges OFF) 
+        and Wireframe Mode (Faces OFF, Edges ON).
+        """
         for m in self.generated_meshes:
-            # pyqtgraph GLMeshItem doesn't strictly support easy wireframe toggle via setGLOptions
-            # This is a workaround by changing the shader or drawing lines.
-            # A simpler visual hack is simply switching shader to 'normalColor' which looks wireframe-y
-            # or finding the specific GL property. 
-            # For standard pyqtgraph, we often just leave it shaded.
-            # Here is a basic implementation if OpenGL allows:
-            pass 
-            # Actual GL wireframe requires glPolygonMode which pyqtgraph abstracts away.
-            # We will stick to the toggles we have.
+            # 1. Toggle Drawing Modes
+            # If Checked: Draw Lines, Hide Faces
+            # If Unchecked: Hide Lines, Draw Faces
+            m.opts['drawEdges'] = checked
+            m.opts['drawFaces'] = not checked 
+            
+            # 2. Set Edge Color
+            # We use a semi-transparent white/grey for the lines
+            # so they look like a structural cage.
+            if checked:
+                # (R, G, B, Alpha) - Light Grey lines
+                m.opts['edgeColor'] = (0.7, 0.7, 0.7, 0.5) 
+            
+            # 3. Force Update
+            # We must tell the item that its internal data has changed
+            m.meshDataChanged()
+            
+        self.gl_view.update()
 
     def toggle_theme(self, checked):
         col = 'white' if checked else '#202020'
@@ -2397,10 +3001,18 @@ class ThreeDViewDialog(QDialog):
         if path: self.gl_view.readQImage().save(path)
     
     def reset_view(self):
-        self.gl_view.items = []
+        """
+        Safely clears the 3D viewport without destroying the OpenGL context.
+        """
+        for mesh in self.generated_meshes:
+            try:
+                if mesh in self.gl_view.items:
+                    self.gl_view.removeItem(mesh)                
+                mesh = None
+            except Exception as e:
+                print(f"Warning during cleanup: {e}")
+
         self.generated_meshes = []
-        self.gl_view.addItem(self.grid_item)
-        self.gl_view.addItem(self.axis_item)
     
     def set_cam(self, a, e): 
         self.gl_view.setCameraPosition(azimuth=a, elevation=e)
@@ -2408,7 +3020,10 @@ class ThreeDViewDialog(QDialog):
     def _create_sep(self):
         f = QFrame(); f.setFrameShape(QFrame.HLine); f.setFrameShadow(QFrame.Sunken)
         return f
-
+    
+    def closeEvent(self, event):
+        self.hide()
+        event.ignore()
 
 # -------------------------- Main window --------------------------
 
@@ -2425,6 +3040,7 @@ class MainWindow(QMainWindow):
         self._update_window_title()
         self.statusBar().showMessage("Welcome!")
         self.resize(1600, 1000)
+        self.threed_dialog = None
 
     def show_help_pdf(self):
         """Finds and opens the user guide PDF."""
@@ -2528,7 +3144,14 @@ class MainWindow(QMainWindow):
 
     def _load_json(self, path):
         with open(path, "r") as f: data = json.load(f)
-        
+
+        # --- NEW: Load Process Sequence ---
+        raw_sequence = data.get('process_sequence', [])
+        loaded_sequence = []
+        if raw_sequence:
+            # Assuming ProcessStep is imported or available
+            loaded_sequence = [ProcessStep.from_dict(s) for s in raw_sequence]
+
         # --- Make sure layer has new attributes ---
         loaded_layers = []
         for l_data in data.get('layers', []):
@@ -2538,7 +3161,8 @@ class MainWindow(QMainWindow):
 
         project = Project(
             units=data.get('units', 'um'), top=data.get('top', 'TOP'),
-            layers=loaded_layers, # Use the potentially updated list
+            layers=loaded_layers, 
+            process_sequence=loaded_sequence, # <--- ADD THIS
             grid_pitch=data.get('grid_pitch', 50),
             canvas_width=data.get('canvas_width', 2000), canvas_height=data.get('canvas_height', 1500)
         )
@@ -2558,6 +3182,11 @@ class MainWindow(QMainWindow):
             # Load etch pairs if they exist
             etch_pairs = [tuple(ep) for ep in c_data.get('etch_pairs', [])]
             project.cells[name] = Cell(polygons=polys, ellipses=ellipses, references=refs, etch_pairs=etch_pairs)
+
+        # Update ID counter if sequence loaded
+        if project.process_sequence:
+            max_id = max(s.id for s in project.process_sequence)
+            project._next_step_id = max_id
 
         project.refresh_layer_map()
         self.current_file_path = path
@@ -2709,19 +3338,6 @@ class MainWindow(QMainWindow):
         except Exception as e: QMessageBox.critical(self, "Export Error", f"Failed to write file: {e}")
         finally: QApplication.restoreOverrideCursor()
 
-
-    def run_full_3d_sim(self):
-        if not self.project: return
-        if not _has_3d_deps:
-            QMessageBox.warning(self, "Error", "3D libraries not installed.")
-            return
-            
-        # Open the dialog
-        dlg = ThreeDViewDialog(self.project, self)
-        # The dialog's start_simulation() calls our new Worker
-        dlg.exec_()
-
-
     # UPDATED to handle new ProcessDialog
     def run_process_step(self):
         if not self.project: return
@@ -2733,73 +3349,227 @@ class MainWindow(QMainWindow):
         ptype = values["type"]
         layer1 = values["layer1"]
         
+        # --- HYBRID SUPPORT: Extract Material ---
+        material_name = values.get("material", None)
+
         # 1. Retrieve the new Mask flag
-        # If "Masked" is checked, it is NOT blanket.
         is_blanket = not values["is_masked"] 
 
-        param1 = values["param1"] if values["param1"] is not None else 0.0
-        param2 = values["param2"] if values["param2"] is not None else 0.0
+        # 2. Params
+        param1 = float(values["param1"] or 0.0)
+        param2 = float(values["param2"] or 0.0)
 
-        # Update Helpers to accept is_blanket
+        # --- FIX: DETERMINE EFFECTIVE LAYER/MASK ARGUMENT ---
+        # For Deposition: 'layer1' is the object being created. We always pass it.
+        # For Etch/Dope/Ox: 'layer1' is a MASK. If blanket, mask is None.
+        if step == "Deposition":
+            effective_arg = layer1
+        else:
+            effective_arg = None if is_blanket else layer1
+        # ----------------------------------------------------
+
+        # --- DISPATCH ---
         if step == "Deposition":
             is_conformal = ("Conformal" in ptype)
-            self._apply_deposition(layer1, param1, is_conformal, is_blanket)
+            # Deposition always uses the explicit layer name
+            self._apply_deposition(layer1, param1, is_conformal, is_blanket, material_name)
 
         elif step == "Etch":
-            is_isotropic = ("Wet" in ptype or "Iso" in ptype)
-            self._apply_etching(layer1, param1, is_isotropic, is_blanket) # param1 is depth here
+            if "Strip" in ptype:
+                # Strip is always global -> Pass None
+                self._apply_special_etch(None, "strip_resist")
+            elif "Lift-Off" in ptype:
+                # Lift-off is always global -> Pass None
+                self._apply_special_etch(None, "etch_liftoff")
+            elif "CMP" in ptype:
+                # CMP is always global -> Pass None
+                self._apply_cmp(None, param1)
+            else:
+                is_isotropic = ("Wet" in ptype or "Iso" in ptype)
+                # Standard Etch uses the effective arg (Mask Name or None)
+                self._apply_etching(effective_arg, param1, is_isotropic, is_blanket)
 
         elif step == "Doping":
-            is_diffusion = ("Diffusion" in ptype)
-            self._apply_doping(layer1, param1, param2, is_diffusion, is_blanket)
+            if "Anneal" in ptype:
+                # Anneal is always global -> Pass None
+                self._apply_anneal(None, param1)
+            else:
+                is_diffusion = ("Diffusion" in ptype)
+                # Standard Doping uses effective arg (Mask Name or None)
+                self._apply_doping(effective_arg, param2, param1, is_diffusion, is_blanket, material_name)
 
         elif step == "Oxidation":
             is_wet = ("Wet" in ptype)
-            self._apply_oxidation(layer1, param1, is_wet, is_blanket)
+            # Oxidation uses effective arg (Mask Name or None)
+            self._apply_oxidation(effective_arg, param1, is_wet, is_blanket)
 
         self.statusBar().showMessage(f"Applied {step} - {ptype} (Blanket: {is_blanket})")
+        
+        # --- FIX: Refresh Recipe UI (Check for _dialog variable name safety) ---
+        if hasattr(self, 'recipe_manager_dialog') and self.recipe_manager_dialog and self.recipe_manager_dialog.isVisible():
+            self.recipe_manager_dialog.refresh_list()
+        elif hasattr(self, 'recipe_manager') and self.recipe_manager and hasattr(self.recipe_manager, 'isVisible') and self.recipe_manager.isVisible():
+            # Fallback in case you used the old variable name
+            self.recipe_manager.refresh_list()
+            
+    # --- Updated Helper Signatures (Recipe Migration) ---
 
-    # --- Updated Helper Signatures ---
-
-    def _apply_deposition(self, layer_name, thickness, is_conformal, is_blanket):
+    def _apply_deposition(self, layer_name, thickness, is_conformal, is_blanket, material_name=None):
         target_layer = self.project.layer_by_name.get(layer_name)
-        if not target_layer: return
-        current = getattr(target_layer, 'thickness_2_5d', 0.0) or 0.0
-        target_layer.thickness_2_5d = max(0.0, current + thickness)
-        target_layer.physics_type = 'depo_conformal' if is_conformal else 'depo_planar'
-        target_layer.is_blanket_sim = is_blanket # SAVE THE FLAG
+        
+        # --- 1. NEW WAY: Add to Recipe List ---
+        params = {
+            "physics_type": 'depo_conformal' if is_conformal else 'depo_planar',
+            "thickness": float(thickness),
+            "is_blanket": is_blanket,
+            "material": material_name if material_name else "Default"
+        }
+        description = f"Deposition ({params['physics_type']}) - {params['thickness']}um"
+        self.project.add_step("Deposition", description, mask=layer_name, params=params)
+
+        if target_layer:
+            target_layer.thickness_2_5d = float(thickness)
+            target_layer.physics_type = params['physics_type']
+            target_layer.is_blanket_sim = is_blanket         
+            if material_name:
+                target_layer.material = material_name
+        
         self._save_state()
-        self._redraw_scene()
+        # self._redraw_scene() 
 
     def _apply_etching(self, mask_layer_name, etch_depth, is_isotropic, is_blanket):
         mask_layer = self.project.layer_by_name.get(mask_layer_name)
-        if not mask_layer: return
-        mask_layer.physics_type = 'etch_iso' if is_isotropic else 'etch_aniso'
-        mask_layer.etch_depth_sim = etch_depth
-        mask_layer.is_blanket_sim = is_blanket # SAVE THE FLAG
-        mask_layer.color = (max(0, mask_layer.color[0]-30), max(0, mask_layer.color[1]-30), max(0, mask_layer.color[2]-30))
-        mask_layer.fill_pattern = "hatch"
+        
+        # --- 1. NEW WAY ---
+        params = {
+            "physics_type": 'etch_iso' if is_isotropic else 'etch_aniso',
+            "thickness": float(etch_depth),
+            "is_blanket": is_blanket
+        }
+        description = f"Etch ({params['physics_type']}) - Depth {params['thickness']}um"
+        self.project.add_step("Etch", description, mask=mask_layer_name, params=params)
+
+        if mask_layer:
+            mask_layer.physics_type = params['physics_type']
+            mask_layer.thickness_2_5d = float(etch_depth)
+            mask_layer.is_blanket_sim = is_blanket 
+            # Visual feedback
+            mask_layer.color = (max(0, mask_layer.color[0]-30), max(0, mask_layer.color[1]-30), max(0, mask_layer.color[2]-30))
+            mask_layer.fill_pattern = "hatch"
+        
         self._save_state()
         self._redraw_scene()
 
-    def _apply_doping(self, layer_name, dose, energy, is_diffusion, is_blanket):
+    def _apply_doping(self, layer_name, dose, energy, is_diffusion, is_blanket, material_name=None):
+        target_layer = self.project.layer_by_name.get(layer_name)
+        
+        # Resolve material logic
+        final_mat = material_name if material_name else "Default"
+
+        # --- 1. NEW WAY ---
+        params = {
+            "physics_type": 'dope_diff' if is_diffusion else 'dope_imp',
+            "thickness": float(energy),
+            "concentration": float(dose),
+            "is_blanket": is_blanket,
+            "material": final_mat
+        }
+        description = f"Doping ({params['physics_type']}) - {final_mat}"
+        self.project.add_step("Doping", description, mask=layer_name, params=params)
+
+        if target_layer:
+            if final_mat: target_layer.material = final_mat
+            target_layer.physics_type = params['physics_type']
+            target_layer.thickness_2_5d = float(energy)
+            target_layer.concentration = dose
+            target_layer.is_blanket_sim = is_blanket
+        
+        self._save_state()
+    
+    def _apply_cmp(self, layer_name, remove_amount):
         target_layer = self.project.layer_by_name.get(layer_name)
         if not target_layer: return
-        if "boron" in target_layer.name.lower(): target_layer.material = "Boron Doped"
-        else: target_layer.material = "Phosphorus Doped"
-        target_layer.physics_type = 'dope_diff' if is_diffusion else 'dope_imp'
-        target_layer.thickness_2_5d = energy
-        target_layer.concentration = dose
-        target_layer.is_blanket_sim = is_blanket # SAVE THE FLAG
+        
+        # --- RECIPE MIGRATION ---
+        params = {
+            "physics_type": 'etch_cmp',
+            "thickness": float(remove_amount),
+            "is_blanket": True
+        }
+        
+        description = f"CMP (Planarization) - Remove {params['thickness']}um"
+        # CMP ignores the mask layer, but we store it if useful for reference
+        self.project.add_step("Etch", description, mask=layer_name, params=params)
+
+        target_layer.physics_type = 'etch_cmp'
+        target_layer.thickness_2_5d = float(remove_amount)
+        target_layer.is_blanket_sim = True 
+        target_layer.fill_pattern = "cross" 
+        
+        self._save_state()
+        self._redraw_scene()
+    
+    def _apply_special_etch(self, layer_name, specific_type):
+        target_layer = self.project.layer_by_name.get(layer_name)
+        if not target_layer: return        
+        
+        # --- RECIPE MIGRATION ---
+        params = {
+            "physics_type": specific_type, # 'strip_resist' or 'etch_liftoff'
+            "thickness": 0.0,
+            "is_blanket": True
+        }
+        
+        desc_map = {"strip_resist": "Strip Resist", "etch_liftoff": "Lift-Off"}
+        description = f"{desc_map.get(specific_type, specific_type)}"
+        
+        self.project.add_step("Etch", description, mask=layer_name, params=params)
+
+        target_layer.physics_type = specific_type
+        target_layer.is_blanket_sim = True
+        target_layer.thickness_2_5d = 0.0 
+        
+        self._save_state()
+
+    def _apply_anneal(self, layer_name, diffusion_length):
+        target_layer = self.project.layer_by_name.get(layer_name)
+        if not target_layer: return
+        
+        # --- RECIPE MIGRATION ---
+        params = {
+            "physics_type": 'dope_anneal',
+            "thickness": float(diffusion_length), # Storing diffusion length in 'thickness'
+            "is_blanket": True
+        }
+        
+        description = f"Thermal Anneal - Diff Length {params['thickness']}um"
+        self.project.add_step("Doping", description, mask=layer_name, params=params)
+
+        target_layer.physics_type = 'dope_anneal'        
+        target_layer.thickness_2_5d = float(diffusion_length)
+        target_layer.is_blanket_sim = True
+        
         self._save_state()
 
     def _apply_oxidation(self, layer_name, thickness, is_wet, is_blanket):
         target_layer = self.project.layer_by_name.get(layer_name)
         if not target_layer: return
+        
+        # --- RECIPE MIGRATION ---
+        params = {
+            "physics_type": 'ox_wet' if is_wet else 'ox_dry',
+            "thickness": float(thickness),
+            "is_blanket": is_blanket
+        }
+        
+        description = f"Oxidation ({params['physics_type']}) - {params['thickness']}um"
+        self.project.add_step("Oxidation", description, mask=layer_name, params=params)
+
         target_layer.physics_type = 'ox_wet' if is_wet else 'ox_dry'
         target_layer.thickness_2_5d = thickness
         target_layer.is_blanket_sim = is_blanket # SAVE THE FLAG
         if is_wet: target_layer.color = (200, 200, 255)
+        
         self._save_state()
         self._redraw_scene()
 
@@ -2978,13 +3748,36 @@ class MainWindow(QMainWindow):
         else:
             self.statusBar().showMessage("Level Set simulation did not produce any contours.")
 
+    def update_layer_list_widget(self):
+        """Refreshes the Right Panel (Layer List) with Colors."""
+        
+        # 1. Identify Widget (Using your correct name)
+        widget = getattr(self, 'list_layers', None) # <--- UPDATED NAME
+        if not widget: return
 
-    # --- Placeholder functions for new UI buttons ---
-    def placeholder_function(self, message="Not implemented yet."):
-         QMessageBox.information(self, "Placeholder", message)
+        widget.clear()
+        
+        for layer in self.project.layers:
+            item = QListWidgetItem(layer.name)
+            item.setFlags(item.flags() | Qt.ItemIsUserCheckable)
+            item.setCheckState(Qt.Checked if layer.visible else Qt.Unchecked)
+            
+            # --- FIX: RESTORE COLOR ICONS ---
+            # Assuming layer.color is a tuple/list (R, G, B)
+            if hasattr(layer, 'color') and layer.color:
+                # Create a small 12x12 colored square
+                pixmap = QPixmap(14, 14)
+                # Fill with layer color
+                c = layer.color
+                qt_col = QColor(c[0], c[1], c[2])
+                pixmap.fill(qt_col)
+                
+                item.setIcon(QIcon(pixmap))
+            # -------------------------------
 
-    def run_recipe_loop(self): self.placeholder_function("Run Recipe Loop (DRIE/Bosch)")
-    def show_virtual_cross_section(self): self.placeholder_function("Show Virtual Cross-Section")
+            item.setData(Qt.UserRole, layer)
+            widget.addItem(item)
+
     def reset_process_simulation(self):
         # Clear etch pairs and potentially reset layer thicknesses/colors/patterns
         if not self.project: return
@@ -2998,11 +3791,6 @@ class MainWindow(QMainWindow):
         self._save_state()
         self._redraw_scene()
         QMessageBox.information(self, "Process Reset", "Simulated 2.5D etch effects have been cleared.")
-
-    def run_locos(self): self.placeholder_function("Run Quick Recipe: Grow Oxide (LOCOS)")
-    def run_lift_off(self): self.placeholder_function("Run Quick Recipe: Metal Lift-off")
-    def run_sti_etch(self): self.placeholder_function("Run Quick Recipe: Trench Etch (STI)")
-    def run_damascene(self): self.placeholder_function("Run Quick Recipe: Damascene Fill")
 
     def toggle_print_contour(self, checked): self.placeholder_function(f"Toggle Print Contour (AI): {'ON' if checked else 'OFF'}")
     def detect_hotspots(self): self.placeholder_function("Detect Hotspots (AI)")
@@ -3195,7 +3983,6 @@ class MainWindow(QMainWindow):
         toggle_rulers_btn.setCheckable(True); toggle_rulers_btn.setChecked(True)
         view_layout.addWidget(self._create_ribbon_group("Display", [
             self._create_action_button("Fill", "maximize", self.fill_view),
-            self._create_action_button("2.5D View", "box", self.show_2_5d_view), # RENAMED
             toggle_rulers_btn, self._create_tool_button("measure", "Measure", "compass")
         ]))
         view_layout.addWidget(self._create_ribbon_group("Zoom", [
@@ -3211,14 +3998,14 @@ class MainWindow(QMainWindow):
         process_layout.setAlignment(Qt.AlignLeft); process_layout.setContentsMargins(0, 5, 0, 5)
 
         process_layout.addWidget(self._create_ribbon_group("Process Simulation", [
-            self._create_action_button("Add Step...", "sliders", self.run_process_step), # Opens enhanced dialog
-            self._create_action_button("X-Section", "scissors", self.show_virtual_cross_section),
+            self._create_action_button("Process Step", "sliders", self.run_process_step), # Opens enhanced dialog
+            self._create_action_button("Recipe Manager", "user-circle-gear", self.open_recipe_manager), 
             self._create_action_button("Reset", "refresh-cw", self.reset_process_simulation),
         ]))
 
         process_layout.addWidget(self._create_ribbon_group("Visualisation", [
-            self._create_action_button("Show 2.5D", "box", self.show_2_5d_view),
-            self._create_action_button("Show 3D", "box", self.show_3d_view),
+            self._create_action_button("2.5D View", "box", self.show_2_5d_view),
+            self._create_action_button("3D View", "box", self.show_3d_view),
         ]))
 
         process_layout.addStretch(); self.tabs.addTab(process_tab, "Process") # NEW TAB
@@ -3569,16 +4356,23 @@ class MainWindow(QMainWindow):
                 self.view.zoomChanged.emit()
 
     def show_3d_view(self):
-        if not self.project: return
-        if not _has_3d_deps:
-            QMessageBox.warning(self, "Missing Libraries", 
-                "Install 'pyqtgraph', 'pyopengl', and 'scikit-image' to use the 3D Voxel View.")
-            return
-            
-        dlg = ThreeDViewDialog(self.project, self)
-        dlg.exec_()
+        if self.threed_dialog is None:
+            self.threed_dialog = ThreeDViewDialog(self.project, self)
+        
+        # Ensure it has the latest project data (in case you loaded a file)
+        self.threed_dialog.project = self.project
+        
+        # Show the existing window (Don't create a new one!)
+        self.threed_dialog.show()
+        self.threed_dialog.raise_()
+        self.threed_dialog.activateWindow()
 
-    # RENAMED from show_3d_view
+    def open_recipe_manager(self):
+        dlg = RecipeManagerDialog(self.project, self)
+        if dlg.exec_() == QDialog.Accepted:
+            self.update_layer_list_widget()
+            self.statusBar().showMessage("Process recipe updated.")
+
     def show_2_5d_view(self):
         if self.project: TwoPointFiveDViewDialog(self.project, self).exec_()
 
@@ -4542,7 +5336,6 @@ class ProjectEncoder(json.JSONEncoder):
             elif isinstance(o, np.bool_):
                  return bool(o)
         return super().default(o)
-
 
 if __name__ == "__main__":
     main()
